@@ -1,6 +1,6 @@
-# autoresearch_for_codex
+# Auto-Codex
 
-`autoresearch_for_codex` turns a single `autoresearch.md` mission file into a persistent Codex runtime.
+`Auto-Codex` turns a single `autoresearch.md` mission file into a persistent Codex runtime.
 
 The design goal is simple:
 
@@ -16,6 +16,10 @@ This is aimed at long-running engineering or research tasks where Codex may need
 - submit jobs
 - wait for hours
 - come back later and continue from disk state instead of chat memory
+
+Repository:
+
+- `https://github.com/hyq718/Auto-Codex`
 
 ## What is here
 

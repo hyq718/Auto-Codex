@@ -2,7 +2,11 @@
 
 ### 项目定位
 
-`autoresearch_for_codex` 的目标是把“给 Codex 一份 mission markdown，然后让它长期自主推进任务”这件事，从单个 prompt 提升为一个可恢复、可追踪、可汇报的 runtime。
+`Auto-Codex` 的目标是把“给 Codex 一份 mission markdown，然后让它长期自主推进任务”这件事，从单个 prompt 提升为一个可恢复、可追踪、可汇报的 runtime。
+
+当前 GitHub 仓库地址：
+
+- `https://github.com/hyq718/Auto-Codex`
 
 这个项目当前聚焦的问题是：
 
