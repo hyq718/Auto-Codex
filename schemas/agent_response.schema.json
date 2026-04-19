@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutoresearchAgentResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "next_sleep_seconds",
+    "jobs_submitted",
+    "artifacts_updated",
+    "plan_updates",
+    "acknowledged_input_ids",
+    "lark_update_markdown",
+    "final_summary_markdown",
+    "model_switch_recommended",
+    "stop_reason"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "working",
+        "waiting_job",
+        "blocked",
+        "done",
+        "failed"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "next_sleep_seconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "jobs_submitted": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "script": {
+            "type": "string"
+          },
+          "log_out": {
+            "type": "string"
+          },
+          "log_err": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    "artifacts_updated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "plan_updates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "step",
+          "status"
+        ],
+        "properties": {
+          "step": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "in_progress",
+              "completed"
+            ]
+          }
+        }
+      }
+    },
+    "acknowledged_input_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lark_update_markdown": {
+      "type": "string"
+    },
+    "final_summary_markdown": {
+      "type": "string"
+    },
+    "model_switch_recommended": {
+      "type": "string"
+    },
+    "stop_reason": {
+      "type": "string"
+    }
+  }
+}

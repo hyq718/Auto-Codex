@@ -1,0 +1,25 @@
+# Autoresearch Runbook
+
+## Mission
+
+- Title: $title
+- Created: $created_at
+- Source mission file: `$source_path`
+- Runtime mission copy: `$runtime_path`
+
+## Reporting Targets
+
+$doc_urls
+
+## Runtime Contract
+
+- `state.json`: machine-readable runtime state
+- `events.jsonl`: append-only supervisor and worker event stream
+- `jobs/`: per-job metadata handoff files
+- `notes/latest_summary.md`: latest human-readable checkpoint
+- `outbox/`: rendered worker replies and pending reporting payloads
+
+## Operator Notes
+
+- The supervisor wakes Codex repeatedly instead of relying on one long session.
+- The worker should prefer short, resumable bursts and keep state on disk.
