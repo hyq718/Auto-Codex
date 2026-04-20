@@ -41,7 +41,7 @@ In the Codex chat, use natural language with `$auto-codex`.
 These are chat messages, not shell commands:
 
 ```text
-$auto-codex 从 ./autoresearch.md 开始一个新的 autoresearch
+$auto-codex Start a new autoresearch run from ./autoresearch.md
 ```
 
 `Auto-Codex` will:
@@ -56,41 +56,41 @@ $auto-codex 从 ./autoresearch.md 开始一个新的 autoresearch
 Approve:
 
 ```text
-$auto-codex 这个 plan 可以了，开始执行
+$auto-codex The plan looks good. Start execution.
 ```
 
 Revise:
 
 ```text
-$auto-codex 先不要开始，把日志分析提前
+$auto-codex Do not start yet. Move log analysis earlier in the plan.
 ```
 
 ### 5. Check status or add new directions
 
 ```text
-$auto-codex 看一下当前状态
+$auto-codex Show me the current status.
 ```
 
 ```text
-$auto-codex 同步一下最近进展
+$auto-codex Sync the latest progress.
 ```
 
 ```text
-$auto-codex 加一条新要求：优先检查最新 job 的 10k eval
+$auto-codex Add a new direction: prioritize checking the latest job for the 10k eval result.
 ```
 
 ### 6. Pause, resume, or stop
 
 ```text
-$auto-codex 暂停当前 autoresearch
+$auto-codex Pause the current autoresearch run.
 ```
 
 ```text
-$auto-codex 恢复当前 autoresearch
+$auto-codex Resume the current autoresearch run.
 ```
 
 ```text
-$auto-codex 停止当前 autoresearch
+$auto-codex Stop the current autoresearch run.
 ```
 
 ## Example Session
@@ -100,7 +100,7 @@ Assume you are in a project directory and already have `./autoresearch.md`.
 In Codex chat:
 
 ```text
-$auto-codex 从 ./autoresearch.md 开始一个新的 autoresearch
+$auto-codex Start a new autoresearch run from ./autoresearch.md
 ```
 
 Codex will show a plan preview instead of immediately running.
@@ -108,23 +108,23 @@ Codex will show a plan preview instead of immediately running.
 Then:
 
 ```text
-$auto-codex 这个 plan 可以了，开始执行
+$auto-codex The plan looks good. Start execution.
 ```
 
 Later, while it is running:
 
 ```text
-$auto-codex 看一下当前状态
+$auto-codex Show me the current status.
 ```
 
 ```text
-$auto-codex 加一条新要求：优先对比最新 job 和参考日志的 eval loss
+$auto-codex Add a new direction: compare the latest job against the reference log on eval loss.
 ```
 
 If the task is waiting on a long job:
 
 ```text
-$auto-codex 同步一下最近进展
+$auto-codex Sync the latest progress.
 ```
 
 The runtime should tell you:
