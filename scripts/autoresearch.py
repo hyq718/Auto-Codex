@@ -31,6 +31,7 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 7200
 MAX_INPUT_EXCERPT_CHARS = 6000
 SYSTEM_SECTION_PREFIX = "Autoresearch System:"
 MODE_RECENT_EVENT_LIMIT = 8
+DEFAULT_RUNTIME_DIRNAME = "auto-codex"
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM}
 GLOBAL_STOP_REQUESTED = False
 
@@ -157,6 +158,13 @@ def ensure_runtime_layout(runtime_dir: Path) -> dict[str, Path]:
         else:
             path.mkdir(parents=True, exist_ok=True)
     return paths
+
+
+def resolve_runtime_dir(runtime_dir_arg: str | None) -> Path:
+    raw = (runtime_dir_arg or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (Path.cwd() / DEFAULT_RUNTIME_DIRNAME).resolve()
 
 
 def default_state(
@@ -1151,7 +1159,7 @@ def init_runtime(args: argparse.Namespace) -> int:
 
     mission_text = read_text(mission_path)
     title = extract_title(mission_text, mission_path.stem)
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     ensure_runtime_layout(runtime_dir)
 
     state = default_state(
@@ -1177,7 +1185,7 @@ def init_runtime(args: argparse.Namespace) -> int:
 
 
 def start_runtime(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     ensure_runtime_layout(runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
@@ -1201,7 +1209,7 @@ def start_runtime(args: argparse.Namespace) -> int:
 
 
 def print_status(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     state = load_state(runtime_dir)
     payload = {
         "runtime_dir": str(runtime_dir),
@@ -1226,7 +1234,7 @@ def print_status(args: argparse.Namespace) -> int:
 
 
 def stop_runtime(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     state = load_state(runtime_dir)
     state["lifecycle"]["stop_requested"] = True
     state["lifecycle"]["stop_reason"] = args.reason
@@ -1243,7 +1251,7 @@ def stop_runtime(args: argparse.Namespace) -> int:
 
 
 def mode_status(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
     print(render_mode_report(runtime_dir, flavor="status"))
@@ -1251,7 +1259,7 @@ def mode_status(args: argparse.Namespace) -> int:
 
 
 def mode_start(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     if not (runtime_dir / "state.json").exists():
         if not args.mission:
             raise SystemExit(f"Runtime not initialized: {runtime_dir}. Provide --mission to bootstrap it.")
@@ -1280,7 +1288,7 @@ def mode_start(args: argparse.Namespace) -> int:
 
 
 def mode_sync(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
     print(render_mode_report(runtime_dir, flavor="sync"))
@@ -1299,13 +1307,13 @@ def mode_update(args: argparse.Namespace) -> int:
         quiet=True,
     )
     add_input(forwarded)
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     print(render_mode_report(runtime_dir, flavor="sync"))
     return 0
 
 
 def mode_plan(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     state = load_state(runtime_dir)
     print("**Current Plan**\n")
     print("\n".join(summarize_plan(state)))
@@ -1313,7 +1321,7 @@ def mode_plan(args: argparse.Namespace) -> int:
 
 
 def mode_jobs(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     state = load_state(runtime_dir)
     print("**Active Jobs**\n")
     print("\n".join(summarize_jobs(state)))
@@ -1321,7 +1329,7 @@ def mode_jobs(args: argparse.Namespace) -> int:
 
 
 def mode_pause(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     state = load_state(runtime_dir)
     state["supervisor"]["paused"] = True
     state["lifecycle"]["status"] = "paused"
@@ -1332,7 +1340,7 @@ def mode_pause(args: argparse.Namespace) -> int:
 
 
 def mode_resume(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     state = load_state(runtime_dir)
     state["supervisor"]["paused"] = False
     if state["lifecycle"].get("status") == "paused":
@@ -1344,7 +1352,7 @@ def mode_resume(args: argparse.Namespace) -> int:
 
 
 def mode_stop(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     stop_args = argparse.Namespace(
         runtime_dir=str(runtime_dir),
         reason=args.reason,
@@ -1401,7 +1409,7 @@ def submit_job(args: argparse.Namespace) -> int:
 
 
 def sync_jobs_command(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     ensure_runtime_layout(runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
@@ -1416,7 +1424,7 @@ def sync_jobs_command(args: argparse.Namespace) -> int:
 
 
 def list_jobs_command(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     ensure_runtime_layout(runtime_dir)
     state = load_state(runtime_dir)
     payload = list(state.get("jobs", {}).values())
@@ -1425,7 +1433,7 @@ def list_jobs_command(args: argparse.Namespace) -> int:
 
 
 def add_input(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     ensure_runtime_layout(runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
@@ -1461,7 +1469,7 @@ def add_input(args: argparse.Namespace) -> int:
 
 
 def list_inputs(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     ensure_runtime_layout(runtime_dir)
     items = load_inputs(runtime_dir)
     if args.pending_only:
@@ -1514,7 +1522,7 @@ def ack_input(args: argparse.Namespace) -> int:
 
 
 def daemon_start(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     ensure_runtime_layout(runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
@@ -1556,7 +1564,7 @@ def daemon_start(args: argparse.Namespace) -> int:
 
 
 def daemon_stop(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     ensure_runtime_layout(runtime_dir)
     snapshot = daemon_snapshot(runtime_dir)
     pid = snapshot["pid"]
@@ -1578,7 +1586,7 @@ def daemon_stop(args: argparse.Namespace) -> int:
 
 
 def daemon_status(args: argparse.Namespace) -> int:
-    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
     snapshot = daemon_snapshot(runtime_dir)
     state = load_state(runtime_dir) if (runtime_dir / "state.json").exists() else None
     payload = {
@@ -1598,12 +1606,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser("init", help="Create a runtime from one autoresearch markdown file.")
     init_parser.add_argument("mission", help="Path to autoresearch.md")
-    init_parser.add_argument("--runtime-dir", required=True, help="Where to create the runtime state")
+    init_parser.add_argument(
+        "--runtime-dir",
+        default="",
+        help=f"Where to create the runtime state. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     init_parser.add_argument("--doc-url", default="", help="Optional Lark/Feishu doc URL to append updates to")
     init_parser.set_defaults(func=init_runtime)
 
     start_parser = subparsers.add_parser("start", help="Start or continue the supervisor loop.")
-    start_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    start_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     start_parser.add_argument("--once", action="store_true", help="Execute a single Codex tick")
     start_parser.add_argument("--search", action="store_true", help="Enable web search inside Codex")
     start_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates")
@@ -1616,18 +1633,33 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.set_defaults(func=start_runtime)
 
     status_parser = subparsers.add_parser("status", help="Show runtime status.")
-    status_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    status_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     status_parser.add_argument("--json", action="store_true", help="Print JSON output")
     status_parser.set_defaults(func=print_status)
 
     stop_parser = subparsers.add_parser("stop", help="Request a graceful stop.")
-    stop_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    stop_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     stop_parser.add_argument("--reason", default="manual stop", help="Reason to record in state and Lark")
     stop_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates")
     stop_parser.set_defaults(func=stop_runtime)
 
     mode_start_parser = subparsers.add_parser("mode-start", help="Enter Auto-Codex conversation mode for a runtime.")
-    mode_start_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_start_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_start_parser.add_argument("--mission", default="", help="Mission markdown used to bootstrap the runtime if needed")
     mode_start_parser.add_argument("--doc-url", default="", help="Optional Lark/Feishu doc URL to append updates to")
     mode_start_parser.add_argument("--daemon", action="store_true", help="Start the background supervisor if it is not running")
@@ -1642,15 +1674,30 @@ def build_parser() -> argparse.ArgumentParser:
     mode_start_parser.set_defaults(func=mode_start)
 
     mode_status_parser = subparsers.add_parser("mode-status", help="Render a conversation-style runtime status report.")
-    mode_status_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_status_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_status_parser.set_defaults(func=mode_status)
 
     mode_sync_parser = subparsers.add_parser("mode-sync", help="Render a sync report with recent runtime events and pending inputs.")
-    mode_sync_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_sync_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_sync_parser.set_defaults(func=mode_sync)
 
     mode_update_parser = subparsers.add_parser("mode-update", help="Add a chat-style input and render the updated sync report.")
-    mode_update_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_update_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_update_parser.add_argument("--message", default="", help="Input content as a direct string")
     mode_update_parser.add_argument("--file", default="", help="Read input content from a file")
     mode_update_parser.add_argument("--title", default="", help="Optional short title")
@@ -1658,30 +1705,60 @@ def build_parser() -> argparse.ArgumentParser:
     mode_update_parser.set_defaults(func=mode_update)
 
     mode_plan_parser = subparsers.add_parser("mode-plan", help="Render the current plan in a conversation-friendly format.")
-    mode_plan_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_plan_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_plan_parser.set_defaults(func=mode_plan)
 
     mode_jobs_parser = subparsers.add_parser("mode-jobs", help="Render active jobs in a conversation-friendly format.")
-    mode_jobs_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_jobs_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_jobs_parser.set_defaults(func=mode_jobs)
 
     mode_pause_parser = subparsers.add_parser("mode-pause", help="Pause the runtime and render the new status.")
-    mode_pause_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_pause_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_pause_parser.set_defaults(func=mode_pause)
 
     mode_resume_parser = subparsers.add_parser("mode-resume", help="Resume a paused runtime and render the new status.")
-    mode_resume_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_resume_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_resume_parser.set_defaults(func=mode_resume)
 
     mode_stop_parser = subparsers.add_parser("mode-stop", help="Stop the runtime and render the final status report.")
-    mode_stop_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_stop_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     mode_stop_parser.add_argument("--reason", default="manual stop", help="Reason to record in state and Lark")
     mode_stop_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates")
     mode_stop_parser.add_argument("--daemon", action="store_true", help="Also stop the background supervisor if it is running")
     mode_stop_parser.set_defaults(func=mode_stop)
 
     add_input_parser = subparsers.add_parser("add-input", help="Add a persisted user input to the runtime inbox.")
-    add_input_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    add_input_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     add_input_parser.add_argument("--message", default="", help="Input content as a direct string")
     add_input_parser.add_argument("--file", default="", help="Read input content from a file")
     add_input_parser.add_argument("--source", default="manual", help="Input source label, such as manual or feishu")
@@ -1691,7 +1768,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_input_parser.set_defaults(func=add_input)
 
     list_inputs_parser = subparsers.add_parser("list-inputs", help="List persisted runtime inputs.")
-    list_inputs_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    list_inputs_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     list_inputs_parser.add_argument("--pending-only", action="store_true", help="Only show pending inputs")
     list_inputs_parser.add_argument("--limit", type=int, default=20, help="Show at most the most recent N inputs")
     list_inputs_parser.add_argument("--json", action="store_true", help="Print JSON output")
@@ -1713,17 +1795,32 @@ def build_parser() -> argparse.ArgumentParser:
     submit_job_parser.set_defaults(func=submit_job)
 
     sync_jobs_parser = subparsers.add_parser("sync-jobs", help="Refresh known job statuses from squeue.")
-    sync_jobs_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    sync_jobs_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     sync_jobs_parser.add_argument("--json", action="store_true", help="Print JSON output")
     sync_jobs_parser.set_defaults(func=sync_jobs_command)
 
     list_jobs_parser = subparsers.add_parser("list-jobs", help="List registered job metadata.")
-    list_jobs_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    list_jobs_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     list_jobs_parser.add_argument("--json", action="store_true", help="Print JSON output")
     list_jobs_parser.set_defaults(func=list_jobs_command)
 
     daemon_start_parser = subparsers.add_parser("daemon-start", help="Run the supervisor in the background.")
-    daemon_start_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    daemon_start_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     daemon_start_parser.add_argument("--search", action="store_true", help="Enable web search inside Codex")
     daemon_start_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates")
     daemon_start_parser.add_argument(
@@ -1735,13 +1832,23 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_start_parser.set_defaults(func=daemon_start)
 
     daemon_stop_parser = subparsers.add_parser("daemon-stop", help="Stop a background supervisor.")
-    daemon_stop_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    daemon_stop_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     daemon_stop_parser.add_argument("--reason", default="manual stop", help="Reason to record in state and Lark")
     daemon_stop_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates")
     daemon_stop_parser.set_defaults(func=daemon_stop)
 
     daemon_status_parser = subparsers.add_parser("daemon-status", help="Show background supervisor status.")
-    daemon_status_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    daemon_status_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
     daemon_status_parser.add_argument("--json", action="store_true", help="Print JSON output")
     daemon_status_parser.set_defaults(func=daemon_status)
 

@@ -37,7 +37,7 @@ def main(argv: list[str]) -> int:
 
     entrypoint = repo_root / "scripts" / "autoresearch.py"
     cmd = [sys.executable, str(entrypoint), *argv]
-    completed = subprocess.run(cmd, cwd=str(repo_root))  # noqa: S603
+    completed = subprocess.run(cmd)  # noqa: S603
     return completed.returncode
 
 

@@ -92,12 +92,15 @@ python3 scripts/autoresearch.py status /path/to/runtime --json
 Conversation-style entry:
 
 ```bash
-python3 scripts/autoresearch.py mode-start /path/to/runtime --mission /path/to/autoresearch.md
-python3 scripts/autoresearch.py mode-status /path/to/runtime
-python3 scripts/autoresearch.py mode-update /path/to/runtime \
+python3 scripts/autoresearch.py mode-start --mission /path/to/autoresearch.md
+python3 scripts/autoresearch.py mode-status
+python3 scripts/autoresearch.py mode-update \
   --title "New direction" \
   --message "Please prioritize the job-monitoring path first."
 ```
+
+If `runtime_dir` is omitted, Auto-Codex now defaults to `./auto-codex` under the current working directory.
+For example, if you run it inside `/path/to/LLaMA-Factory`, the runtime will be created under `/path/to/LLaMA-Factory/auto-codex`.
 
 ## Install as a Codex skill
 
@@ -139,10 +142,12 @@ The skill ships with a wrapper launcher:
 
 ```bash
 python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py repo-root
-python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py mode-status /path/to/runtime
+python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py mode-start --mission /path/to/autoresearch.md
+python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py mode-status
 ```
 
 If the repo is installed somewhere else, set `AUTO_CODEX_REPO=/path/to/Auto-Codex` so the wrapper can locate the runtime entrypoint.
+The wrapper preserves your current working directory, so the default runtime still lands in `./auto-codex` under the project you are working on.
 
 ## Install as a local plugin
 

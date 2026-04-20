@@ -12,12 +12,13 @@ Use this skill to operate the Auto-Codex runtime through a conversation-friendly
 Prefer the wrapper script in this skill:
 
 ```bash
-python3 scripts/auto_codex.py mode-start RUNTIME_DIR --mission /path/to/autoresearch.md
-python3 scripts/auto_codex.py mode-status RUNTIME_DIR
-python3 scripts/auto_codex.py mode-update RUNTIME_DIR --message "New direction"
+python3 scripts/auto_codex.py mode-start --mission /path/to/autoresearch.md
+python3 scripts/auto_codex.py mode-status
+python3 scripts/auto_codex.py mode-update --message "New direction"
 ```
 
 If the repo is installed somewhere else, set `AUTO_CODEX_REPO` first so the wrapper can find it.
+If `RUNTIME_DIR` is omitted, the runtime defaults to `./auto-codex` under the current working directory.
 
 ## Workflow
 
@@ -49,5 +50,6 @@ Read [references/commands.md](references/commands.md) only when you need the exa
 - Prefer `mode-*` commands when the user wants to stay oriented in the active Codex conversation.
 - Treat `mode-update` as the bridge from chat into the runtime inbox.
 - Reuse the same runtime directory across turns; the persistent state is the real source of continuity.
+- Prefer the default `./auto-codex` runtime under the user's current project directory unless the user explicitly asks for another location.
 - Use `status --json`, `daemon-status --json`, `list-inputs --json`, or `list-jobs --json` only when you need machine-readable inspection.
 - Use `start` or `daemon-start` only when you are intentionally running the underlying supervisor loop.
