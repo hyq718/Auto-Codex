@@ -1,683 +1,391 @@
 # Auto-Codex
 
-`Auto-Codex` turns a single `autoresearch.md` mission file into a persistent Codex runtime.
+`Auto-Codex` turns one `autoresearch.md` mission into a persistent Codex runtime that can keep working across long waits, track jobs on disk, report to Feishu, and resume with low-token context.
 
-It now also exposes a conversation-mode adapter so the runtime can be surfaced as a `/autoresearch`-style control loop instead of only as low-level supervisor commands.
+It is built for tasks like:
 
-The design goal is simple:
-
-- user input: one mission markdown
-- runtime behavior: Codex works in short bursts
-- persistence: state is stored on disk
-- recovery: the supervisor wakes Codex again after long waits
-
-This is aimed at long-running engineering or research tasks where Codex may need to:
-
-- read a mission file
-- modify code or scripts
-- submit jobs
-- wait for hours
-- come back later and continue from disk state instead of chat memory
+- long engineering investigations
+- code changes followed by cluster jobs
+- repeated log inspection and retry loops
+- multi-hour or multi-day autoresearch
 
 Repository:
 
 - `https://github.com/hyq718/Auto-Codex`
 
-## What is here
+## Quick Start
 
-- [`scripts/autoresearch.py`](./scripts/autoresearch.py): init, start, status, and stop commands
-- installable Codex skill: [`skills/auto-codex`](./skills/auto-codex)
-- repo-local plugin: [`plugins/auto-codex`](./plugins/auto-codex/.codex-plugin/plugin.json)
-- conversation-mode commands: `mode-start`, `mode-status`, `mode-sync`, `mode-update`, `mode-plan`, `mode-jobs`, `mode-pause`, `mode-resume`, `mode-stop`
-- background supervisor support: `daemon-start`, `daemon-stop`, `daemon-status`
-- persisted input support: `add-input`, `list-inputs`, `ack-input`
-- Feishu polling and heartbeat support built into the supervisor
-- baseline Slurm helpers: `submit-job`, `sync-jobs`, `list-jobs`
-- [`skills/autoresearch/SKILL.md`](./skills/autoresearch/SKILL.md): reusable Codex skill entry
-- [`schemas/agent_response.schema.json`](./schemas/agent_response.schema.json): structured worker response contract
-- [`templates/`](./templates): generated prompt and runbook templates
-
-## How it works
-
-Instead of asking one long-lived Codex session to stay alive forever, this project uses a persistent runtime:
-
-1. `init` copies your mission markdown into a runtime directory and creates on-disk state.
-2. `start` launches a supervisor loop.
-3. On each tick, the supervisor calls `codex exec` with a structured prompt.
-4. Before each worker burst, the supervisor polls pending inputs and can also poll Feishu for new user-visible document content.
-5. Codex does one useful chunk of work, writes artifacts, and returns structured JSON.
-6. The supervisor updates local state, optional Lark reporting, and sleeps until the next tick.
-7. When a job is still running, the runtime waits and resumes later.
-
-That means the real memory is in files like `state.json`, `plan.json`, `jobs/*.json`, and `notes/latest_summary.md`, not in a single chat session.
-
-## Requirements
-
-Minimum requirements:
-
-- `python3`
-- `codex`
-
-Optional but recommended:
-
-- `lark-cli` for Feishu/Lark doc updates
-- `sbatch` / `squeue` if your mission submits cluster jobs
-
-The current implementation assumes:
-
-- `codex exec` is available on `PATH`
-- the runtime directory is writable
-- your mission file already contains enough instructions for Codex to act
-
-## Quick start
-
-One-command local install after `git clone`:
+### 1. Install
 
 ```bash
+git clone https://github.com/hyq718/Auto-Codex.git
 cd Auto-Codex
 ./install.sh
 ```
 
-```bash
-python3 scripts/autoresearch.py init /path/to/autoresearch.md --runtime-dir /path/to/runtime
-python3 scripts/autoresearch.py start /path/to/runtime --search
-```
+Then restart Codex so it can rescan local skills and plugins.
 
-Check progress:
+### 2. Open Codex in the project you want to research
 
-```bash
-python3 scripts/autoresearch.py status /path/to/runtime --json
-```
-
-Conversation-style entry:
-
-```bash
-python3 scripts/autoresearch.py mode-start --mission /path/to/autoresearch.md
-python3 scripts/autoresearch.py mode-status
-python3 scripts/autoresearch.py mode-update \
-  --title "New direction" \
-  --message "Please prioritize the job-monitoring path first."
-```
-
-If `runtime_dir` is omitted, Auto-Codex now defaults to `./auto-codex` under the current working directory.
-For example, if you run it inside `/path/to/LLaMA-Factory`, the runtime will be created under `/path/to/LLaMA-Factory/auto-codex`.
-
-## Install as a Codex skill
-
-The repository now ships with a dedicated skill package at [`skills/auto-codex`](./skills/auto-codex).
-
-Recommended installer:
-
-```bash
-./install.sh
-```
-
-What it does by default:
-
-- installs `auto-codex` into `~/.agents/skills/auto-codex`
-- installs `auto-codex` into `~/.codex/skills/auto-codex`
-- installs a local plugin into `~/plugins/auto-codex`
-- updates `~/.agents/plugins/marketplace.json`
-
-Useful flags:
-
-```bash
-./install.sh --copy
-./install.sh --no-plugin
-./install.sh --no-codex-skill
-./install.sh --no-agents-skill
-```
-
-Install it into the local Codex skill directory:
-
-```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-ln -sfn /home/yqhao/autoresearch_for_codex/skills/auto-codex \
-  "${CODEX_HOME:-$HOME/.codex}/skills/auto-codex"
-```
-
-After that, new Codex sessions can discover `auto-codex` as a first-class skill.
-
-The skill ships with a wrapper launcher:
-
-```bash
-python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py repo-root
-python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py mode-start --mission /path/to/autoresearch.md
-python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py mode-status
-```
-
-If the repo is installed somewhere else, set `AUTO_CODEX_REPO=/path/to/Auto-Codex` so the wrapper can locate the runtime entrypoint.
-The wrapper preserves your current working directory, so the default runtime still lands in `./auto-codex` under the project you are working on.
-
-## Install as a local plugin
-
-The repository also ships with a repo-local plugin scaffold at [`plugins/auto-codex`](./plugins/auto-codex/.codex-plugin/plugin.json).
-
-Repo-local marketplace files:
-
-- [`plugins/auto-codex/.codex-plugin/plugin.json`](./plugins/auto-codex/.codex-plugin/plugin.json)
-- [`/.agents/plugins/marketplace.json`](./.agents/plugins/marketplace.json)
-
-For this machine I also wired a home-local marketplace entry:
-
-- `~/plugins/auto-codex` -> symlink to the repo plugin
-- `~/.agents/plugins/marketplace.json`
-
-If your Codex frontend supports local plugin discovery, fully restart the app after these files exist so it can rescan the marketplace.
-
-Run in the background:
-
-```bash
-python3 scripts/autoresearch.py daemon-start /path/to/runtime --search
-python3 scripts/autoresearch.py daemon-status /path/to/runtime --json
-```
-
-Add a persisted user instruction:
-
-```bash
-python3 scripts/autoresearch.py add-input /path/to/runtime \
-  --title "Change direction" \
-  --message "Please prioritize the job-monitoring path first."
-python3 scripts/autoresearch.py list-inputs /path/to/runtime --pending-only --json
-```
-
-Submit and sync a Slurm job:
-
-```bash
-python3 scripts/autoresearch.py submit-job /path/to/runtime ./train.sbatch --notes "smoke test"
-python3 scripts/autoresearch.py sync-jobs /path/to/runtime --json
-python3 scripts/autoresearch.py list-jobs /path/to/runtime --json
-```
-
-Stop gracefully:
-
-```bash
-python3 scripts/autoresearch.py stop /path/to/runtime --reason "manual stop"
-python3 scripts/autoresearch.py daemon-stop /path/to/runtime --reason "manual stop"
-```
-
-## Example
-
-If your mission file is:
-
-- `/home/yqhao/autoresearch.md`
-
-you can create and run a runtime like this:
-
-```bash
-cd /home/yqhao/autoresearch_for_codex
-python3 scripts/autoresearch.py init /home/yqhao/autoresearch.md \
-  --runtime-dir /home/yqhao/autoresearch_for_codex/runtime/megatron-depth-softmax
-
-python3 scripts/autoresearch.py start \
-  /home/yqhao/autoresearch_for_codex/runtime/megatron-depth-softmax \
-  --search
-```
-
-For a long-running unattended session, use the daemon form instead:
-
-```bash
-python3 scripts/autoresearch.py daemon-start \
-  /home/yqhao/autoresearch_for_codex/runtime/megatron-depth-softmax \
-  --search
-```
-
-If the mission file already contains a Feishu/Lark doc URL, the runtime will try to append progress there.
-
-If you want to force a reporting target explicitly:
-
-```bash
-python3 scripts/autoresearch.py init /home/yqhao/autoresearch.md \
-  --runtime-dir /home/yqhao/autoresearch_for_codex/runtime/megatron-depth-softmax \
-  --doc-url "https://xxx.feishu.cn/docx/xxxx"
-```
-
-## Commands
-
-### Conversation mode
-
-The new mode adapter is meant to mirror an in-chat `/autoresearch` experience on top of the existing runtime.
-
-Recommended mapping:
-
-- `/autoresearch start` -> `mode-start`
-- `/autoresearch status` -> `mode-status`
-- `/autoresearch sync` -> `mode-sync`
-- `/autoresearch update` -> `mode-update`
-- `/autoresearch plan` -> `mode-plan`
-- `/autoresearch jobs` -> `mode-jobs`
-- `/autoresearch pause` -> `mode-pause`
-- `/autoresearch resume` -> `mode-resume`
-- `/autoresearch stop` -> `mode-stop`
-
-`mode-*` commands do not replace the runtime. They render and manipulate the same persisted state that the supervisor uses.
-
-### `mode-start`
-
-Enter Auto-Codex mode for a runtime. If the runtime does not exist yet, `mode-start` can bootstrap it from one mission markdown.
-
-```bash
-python3 scripts/autoresearch.py mode-start RUNTIME_DIR --mission /path/to/autoresearch.md
-```
-
-Useful flags:
-
-- `--mission`: bootstrap the runtime if it does not exist yet
-- `--doc-url`: attach a Lark/Feishu doc target during bootstrap
-- `--daemon`: also start the background supervisor
-- `--search`: enable web search when `--daemon` starts the supervisor
-- `--codex-config key=value`: pass extra `-c key=value` to `codex exec` when `--daemon` is used
-
-### `mode-status`
-
-Render the current runtime as a conversation-style status report.
-
-```bash
-python3 scripts/autoresearch.py mode-status RUNTIME_DIR
-```
-
-### `mode-sync`
-
-Render a sync report with recent progress, inputs, and runtime events.
-
-```bash
-python3 scripts/autoresearch.py mode-sync RUNTIME_DIR
-```
-
-### `mode-update`
-
-Persist a chat-style input and immediately re-render the sync report.
-
-```bash
-python3 scripts/autoresearch.py mode-update RUNTIME_DIR \
-  --title "Change direction" \
-  --message "Please prioritize the job-monitoring path first."
-```
-
-### `mode-plan`
-
-Render the current plan in a conversation-friendly format.
-
-```bash
-python3 scripts/autoresearch.py mode-plan RUNTIME_DIR
-```
-
-### `mode-jobs`
-
-Render active jobs in a conversation-friendly format.
-
-```bash
-python3 scripts/autoresearch.py mode-jobs RUNTIME_DIR
-```
-
-### `mode-pause`
-
-Pause the runtime and surface the updated status.
-
-```bash
-python3 scripts/autoresearch.py mode-pause RUNTIME_DIR
-```
-
-### `mode-resume`
-
-Resume a paused runtime and surface the updated status.
-
-```bash
-python3 scripts/autoresearch.py mode-resume RUNTIME_DIR
-```
-
-### `mode-stop`
-
-Stop the runtime and surface the final status. Add `--daemon` to also stop the background supervisor process.
-
-```bash
-python3 scripts/autoresearch.py mode-stop RUNTIME_DIR --reason "manual stop"
-```
-
-### `init`
-
-Create a new runtime from one mission markdown.
-
-```bash
-python3 scripts/autoresearch.py init MISSION.md --runtime-dir RUNTIME_DIR
-```
-
-Useful flags:
-
-- `--runtime-dir`: target runtime directory
-- `--doc-url`: override or add a Lark document URL for updates
-
-### `start`
-
-Start or resume the supervisor loop.
-
-```bash
-python3 scripts/autoresearch.py start RUNTIME_DIR --search
-```
-
-Useful flags:
-
-- `--once`: run exactly one Codex tick, then exit
-- `--search`: enable web search in `codex exec`
-- `--disable-lark`: skip Lark document updates
-- `--codex-config key=value`: pass extra `-c key=value` to `codex exec`
+`Auto-Codex` now defaults its runtime to `./auto-codex` under your current working directory.
 
 Example:
 
-```bash
-python3 scripts/autoresearch.py start /path/to/runtime \
-  --once \
-  --search \
-  --codex-config 'shell_environment_policy.inherit=all'
+- if you run it inside `/path/to/LLaMA-Factory`
+- the runtime will be created at `/path/to/LLaMA-Factory/auto-codex`
+
+### 3. Start from a mission markdown
+
+In the Codex chat, use natural language with `$auto-codex`.
+
+These are chat messages, not shell commands:
+
+```text
+$auto-codex 从 ./autoresearch.md 开始一个新的 autoresearch
 ```
 
-### `status`
+`Auto-Codex` will:
 
-Inspect the current runtime state.
+- read the mission
+- create `./auto-codex`
+- generate a plan preview
+- stop and wait for confirmation before execution
 
-```bash
-python3 scripts/autoresearch.py status RUNTIME_DIR --json
+### 4. Approve or revise the plan
+
+Approve:
+
+```text
+$auto-codex 这个 plan 可以了，开始执行
 ```
 
-This includes:
+Revise:
 
-- lifecycle status
-- active model
-- next sleep interval
-- latest summary
-- current job ids
-- current plan
-- persisted input counters
-- daemon pid and log path
-
-### `add-input`
-
-Persist a new user or system instruction into the runtime.
-
-```bash
-python3 scripts/autoresearch.py add-input RUNTIME_DIR \
-  --title "Suggestion" \
-  --message "Try the SLURM integration path first."
+```text
+$auto-codex 先不要开始，把日志分析提前
 ```
 
-Useful flags:
+### 5. Check status or add new directions
 
-- `--message`: direct text payload
-- `--file`: read payload from a file
-- `--source`: source label such as `manual` or `feishu`
-- `--author`: author label
-- `--json`: print the created record as JSON
-
-### `list-inputs`
-
-Inspect persisted input records.
-
-```bash
-python3 scripts/autoresearch.py list-inputs RUNTIME_DIR --pending-only --json
+```text
+$auto-codex 看一下当前状态
 ```
 
-### `ack-input`
-
-Mark one persisted input as acknowledged.
-
-```bash
-python3 scripts/autoresearch.py ack-input RUNTIME_DIR INPUT_ID \
-  --resolution "Captured and queued for the next worker tick."
+```text
+$auto-codex 同步一下最近进展
 ```
 
-### `submit-job`
-
-Submit an `sbatch` script and register the job in runtime state.
-
-```bash
-python3 scripts/autoresearch.py submit-job RUNTIME_DIR ./train.sbatch --notes "smoke test"
+```text
+$auto-codex 加一条新要求：优先检查最新 job 的 10k eval
 ```
 
-### `sync-jobs`
+### 6. Pause, resume, or stop
 
-Refresh known jobs from `squeue`.
-
-```bash
-python3 scripts/autoresearch.py sync-jobs RUNTIME_DIR --json
+```text
+$auto-codex 暂停当前 autoresearch
 ```
 
-### `list-jobs`
-
-List registered job metadata.
-
-```bash
-python3 scripts/autoresearch.py list-jobs RUNTIME_DIR --json
+```text
+$auto-codex 恢复当前 autoresearch
 ```
 
-### `daemon-start`
-
-Launch the supervisor in the background and return immediately.
-
-```bash
-python3 scripts/autoresearch.py daemon-start RUNTIME_DIR --search
+```text
+$auto-codex 停止当前 autoresearch
 ```
 
-Useful flags:
+## Example Session
 
-- `--search`: enable web search in `codex exec`
-- `--disable-lark`: skip Lark document updates
-- `--codex-config key=value`: pass extra `-c key=value` to `codex exec`
+Assume you are in a project directory and already have `./autoresearch.md`.
 
-Output:
+In Codex chat:
 
-- runtime path
-- daemon pid
-- supervisor log path
-
-### `daemon-status`
-
-Inspect the background supervisor state.
-
-```bash
-python3 scripts/autoresearch.py daemon-status RUNTIME_DIR --json
+```text
+$auto-codex 从 ./autoresearch.md 开始一个新的 autoresearch
 ```
 
-### `daemon-stop`
+Codex will show a plan preview instead of immediately running.
 
-Gracefully stop a background supervisor.
+Then:
 
-```bash
-python3 scripts/autoresearch.py daemon-stop RUNTIME_DIR --reason "manual stop"
+```text
+$auto-codex 这个 plan 可以了，开始执行
 ```
 
-### `stop`
+Later, while it is running:
 
-Request a graceful stop and optionally write a stop note to Lark.
-
-```bash
-python3 scripts/autoresearch.py stop RUNTIME_DIR --reason "manual stop"
+```text
+$auto-codex 看一下当前状态
 ```
 
-## Runtime layout
+```text
+$auto-codex 加一条新要求：优先对比最新 job 和参考日志的 eval loss
+```
 
-After `init`, the runtime contains:
+If the task is waiting on a long job:
 
-- `mission.md`: copied mission file
-- `runbook.md`: generated operator summary
-- `state.json`: machine-readable state
-- `plan.json`: machine-readable current plan
-- `events.jsonl`: append-only event log
-- `inputs.jsonl`: persisted input queue
-- `jobs/`: per-job handoff files
-- `notes/latest_summary.md`: latest human-readable checkpoint
-- `notes/plan.md`: rendered plan for quick inspection
-- `outbox/`: Codex responses and reporting payloads
+```text
+$auto-codex 同步一下最近进展
+```
+
+The runtime should tell you:
+
+- current phase
+- current phase plan
+- next action
+- focused jobs
+- sleep reason
+
+## What Auto-Codex Actually Does
+
+This project is not just a prompt. It has three practical layers:
+
+### 1. Mode Layer
+
+This is the user-facing control layer inside Codex chat.
+
+It is what `$auto-codex` drives.
+
+Its job is to:
+
+- bootstrap a runtime from one mission markdown
+- show the plan preview
+- accept user steering in natural language
+- render runtime state back into a readable report
+
+### 2. Runtime / Supervisor Layer
+
+This is the persistent execution layer.
+
+Its job is to:
+
+- store state on disk
+- wake up future worker bursts
+- track inputs, jobs, events, notes, and plan files
+- update Feishu
+- keep working across long waits
+
+### 3. Worker Layer
+
+This is each short burst of actual Codex work.
+
+A worker does not depend on chat memory. It reads runtime files, performs one useful chunk of work, and writes back structured results.
+
+## The Main Design Principles
+
+### Plan Preview First
+
+`Auto-Codex` no longer starts execution immediately after reading the mission.
+
+It first creates a plan preview and waits for approval.
+
+That means it has:
+
+- `plan.preview.json`
+- `plan.json`
+
+The idea is simple:
+
+- preview first
+- user confirms
+- execution starts
+
+### Summary First, Deep Read Later
+
+The runtime is designed to reduce token waste.
+
+It should:
+
+- read the smallest necessary context first
+- read summaries before full files
+- search before reading long logs
+- widen context only when the current step really needs it
+
+### Recovery Is for Future Workers
+
+The most important state is not “what happened before”.
+
+It is:
+
+- what the next worker should do first
+- where it should look
+- what it should search for
+- how it should widen the read budget if the first retrieval misses
+
+This is why the runtime keeps a `resume_status.md` and an execution packet in `state.json`.
+
+## Runtime Layout
+
+Inside the project you are researching, `Auto-Codex` will create `./auto-codex`.
 
 Important files:
 
-- `state.json`: top-level machine-readable state
-- `plan.json`: the current step plan that the worker can update over time
-- `events.jsonl`: append-only event stream from the supervisor
-- `inputs.jsonl`: append-only style persisted input records managed by CLI
-- `jobs/<job_id>.json`: handoff metadata for long-running jobs
-- `logs/codex/*.log`: raw logs for each `codex exec` invocation
-- `logs/supervisor.log`: stdout/stderr of the background daemon process
-- `supervisor.pid`: pid file for `daemon-start`
+- `mission.md`: copied mission
+- `state.json`: main machine-readable state
+- `plan.preview.json`: unapproved plan
+- `plan.json`: current approved plan
+- `events.jsonl`: append-only event log
+- `inputs.jsonl`: persisted chat or Feishu inputs
+- `jobs/<job_id>.json`: per-job metadata
+- `notes/plan_preview.md`: human-readable preview plan
+- `notes/plan.md`: human-readable current plan
+- `notes/jobs_focus.md`: only the jobs the next tick should inspect first
+- `notes/latest_summary.md`: concise latest checkpoint
+- `notes/resume_status.md`: current phase plus next action packet
+- `logs/supervisor.log`: supervisor output
+- `logs/codex/`: per-worker raw logs
 
-## Persisted input layer
+## Token-Aware Job Reading
 
-The runtime now has a first-class input layer for user feedback and future Feishu-synced instructions.
+Workers should not scan the entire `jobs/` directory by default.
 
-Current behavior:
+Instead, each tick writes:
 
-- `add-input` stores an input record in `inputs.jsonl`
-- `list-inputs` shows recent or pending records
-- `ack-input` marks one record as acknowledged with an optional resolution
-- `status --json` and `daemon-status --json` expose input counters
-- supervisor ticks inject pending inputs into the worker prompt
-- worker responses can acknowledge consumed inputs with `acknowledged_input_ids`
+- `notes/jobs_focus.md`
 
-Inputs can come from two places:
+That file contains only the small set of currently relevant jobs.
 
-- local runtime commands such as `add-input`
-- Feishu document polling when the runtime has a doc URL
+The intended read order is:
 
-The conversation mode uses the same input layer:
+1. read `jobs_focus.md`
+2. open the most relevant job log
+3. search for the exact signal
+4. read a small local window
+5. only then widen to more logs or more jobs
 
-- `mode-update` writes `source=chat` input records
-- supervisor ticks inject pending inputs into the worker prompt
-- the worker can acknowledge them through `acknowledged_input_ids`
+This is the default strategy for saving tokens.
 
-## Conversation mode architecture
+## Recovery-Oriented Status
 
-The current implementation is intentionally split into two layers:
+`Auto-Codex` now persists not only the plan, but also the exact recovery packet for the next worker.
 
-- `runtime`: persistent state, worker bursts, job tracking, Lark sync, recovery
-- `mode adapter`: conversation-style commands that render runtime state into a stable chat-friendly structure
+The runtime keeps:
 
-The mode report currently surfaces:
+- `execution.current_phase`
+- `execution.phase_plan`
+- `execution.next_action`
 
-- goal
-- current plan
-- latest progress
-- waiting or blocker state
-- active jobs
-- pending inputs
-- recent runtime events
-- next action
+And also renders them to:
 
-That means the repo now supports both:
+- `notes/resume_status.md`
 
-- unattended execution through `start` or `daemon-start`
-- user-visible control through `mode-*` commands
+This is what tells a future worker:
 
-## Plan support
+- what to do first
+- why this is the next step
+- where to look
+- what patterns to search
+- what counts as success
+- what to do if the signal is missing
 
-The runtime has a built-in plan layer.
+## Sleep Strategy
 
-When you run `init`:
+The runtime now uses a dual sleep strategy.
 
-- the mission markdown is scanned for sections such as `plan`, `priority`, `workflow`, `步骤`, `顺序`, or `工作优先级`
-- if such a section exists, its list items are used to seed the plan
-- otherwise a default starter plan is created
+### Default fallback
 
-During execution:
+- wake within `1 hour`
 
-- the worker returns `plan_updates`
-- the supervisor writes them into `plan.json`
-- a readable copy is rendered to `notes/plan.md`
-- `status --json` includes the current plan
+### Preferred path
 
-This gives you something close to Codex plan mode, but persisted on disk and recoverable across long waits.
+If the current critical path is a long-running job, the runtime tries to estimate a better wake-up time from logs.
 
-## Lark / Feishu updates
+It can use signals such as:
 
-If a mission contains a `docx`, `doc`, or `wiki` URL, or if `--doc-url` is passed to `init`, the runtime will use it as the default progress target.
+- `5s/it`
+- `it/s`
+- `iteration time: 4.0 s`
+- `global_step=9500`
+- `iteration 8200`
+- `10k`
+- `10000`
+- `eval every 1000 steps`
 
-Current behavior:
+Then it estimates when the next useful checkpoint should appear.
 
-- update mechanism: `lark-cli docs +update --mode append`
-- payload source: worker field `lark_update_markdown`
-- supervisor heartbeat also writes to the same document
-- completion writes a final summary section
-- stop signal handling: a stop message is appended unless `--disable-lark` is set
+The estimate is still capped at `1 hour`.
 
-## Feishu polling
+So the effective rule is:
 
-When a runtime has a Feishu/Lark doc URL, the supervisor can periodically read the document and convert new user-visible content into persisted `feishu` inputs.
+- estimate if possible
+- otherwise fall back to `1 hour`
+- never sleep longer than `1 hour`
 
-Current behavior:
+## Feishu Integration
 
-- default poll interval: 2 hours
-- system-generated document sections use the prefix `Autoresearch System:`
-- Feishu polling ignores those system sections to reduce feedback loops
-- append-like user edits are converted into new persisted inputs
+If the mission contains a Feishu/Lark doc URL, or you pass one explicitly, the runtime can:
 
-Current limitation:
+- append progress updates
+- append stop notes
+- append final summaries
+- periodically poll the doc for new user-visible input
 
-- this is best-effort document diffing, not comment-level or block-level semantic tracking
+So Feishu plays three roles:
 
-## Slurm helpers
+- progress panel
+- asynchronous input panel
+- remote review panel
 
-The runtime now includes a baseline Slurm layer:
+## Installation Modes
 
-- `submit-job`: runs `sbatch` and registers the parsed job id
-- `sync-jobs`: refreshes known jobs from `squeue`
-- `list-jobs`: reads current job metadata from runtime state
+This repo provides:
 
-## Model behavior
+- installable skill: [`skills/auto-codex`](./skills/auto-codex)
+- repo-local plugin: [`plugins/auto-codex`](./plugins/auto-codex/.codex-plugin/plugin.json)
+- installer: [`install.sh`](./install.sh)
 
-The supervisor currently prefers:
+By default `./install.sh` installs:
 
-- `gpt-5.4`
-- fallback: `gpt-5.3-codex-spark`
+- `auto-codex` into `~/.agents/skills/auto-codex`
+- `auto-codex` into `~/.codex/skills/auto-codex`
+- a local plugin into `~/plugins/auto-codex`
+- a marketplace entry into `~/.agents/plugins/marketplace.json`
 
-If a Codex call appears to fail due to a limit or quota issue, the supervisor can try the fallback model on the next attempt.
+## When You Need Explicit Commands
 
-## Current limitations
+Natural language should be the normal user experience in Codex chat.
 
-This is a minimal usable prototype, not a finished product.
+If you need exact low-level control, the underlying mode commands are:
 
-Current limitations include:
+- `mode-start`
+- `mode-approve-plan`
+- `mode-revise-plan`
+- `mode-status`
+- `mode-sync`
+- `mode-update`
+- `mode-plan`
+- `mode-jobs`
+- `mode-pause`
+- `mode-resume`
+- `mode-stop`
 
-- no hard validation yet that Lark auth/scopes are configured correctly
-- no plugin packaging yet; this is currently a `skill + scripts` project
-- no deep scheduler semantics yet beyond `sbatch` registration plus `squeue` refresh
-- Feishu input detection uses document diffing rather than richer structured signals
-- the `/autoresearch` experience is currently exposed as CLI `mode-*` commands, not as a native Codex slash command or plugin UI yet
+The wrapper script is:
 
-## Development
+- [`skills/auto-codex/scripts/auto_codex.py`](./skills/auto-codex/scripts/auto_codex.py)
 
-Basic validation:
+And the lower-level runtime entrypoint is:
 
-```bash
-python3 -m py_compile scripts/autoresearch.py
-python3 scripts/autoresearch.py --help
-```
+- [`scripts/autoresearch.py`](./scripts/autoresearch.py)
 
-Demo runtime:
+## Recommended Environment
 
-```bash
-python3 scripts/autoresearch.py init examples/minimal-autoresearch.md \
-  --runtime-dir runtime/demo
-python3 scripts/autoresearch.py status runtime/demo --json
-```
+For long-running autoresearch on a cluster, the practical recommendation is:
 
-Daemon demo:
+- run Codex in `tmux`
+- run it on a CPU compute node if that is how your cluster is meant to be used
+- avoid leaving long-lived supervisor processes on login nodes
 
-```bash
-python3 scripts/autoresearch.py daemon-start runtime/demo
-python3 scripts/autoresearch.py daemon-status runtime/demo --json
-tail -f runtime/demo/logs/supervisor.log
-```
+## Current Limits
 
-## Next directions
+This project already has a strong base, but it is not finished in every direction.
 
-Natural next steps for this repo:
+Current boundaries:
 
-- add optional tmux/systemd wrappers on top of the built-in daemon mode
-- add stronger SLURM helpers around `sbatch`, `squeue`, `sacct`, and log parsing
-- add richer Lark reporting helpers
-- package the skill for easier installation
-- add example missions for research, coding, and experiment management
+- it is still a skill-driven mode, not a native built-in `/autoresearch` command
+- plugin discovery still depends on the Codex frontend
+- Slurm support is still a baseline helper layer, not a full scheduler integration
+- the main runtime is still single-worker, not a full multi-agent coordinator
+- the sleep estimator covers common training-log formats, not every framework-specific style
 
-## Notes
+## In One Sentence
 
-- Lark document updates use `lark-cli docs +update`.
-- Model fallback is built in: the supervisor tries `gpt-5.4` first and then `gpt-5.3-codex-spark`.
-- The worker is expected to return JSON that matches the bundled schema.
+`Auto-Codex` is currently a low-token, recovery-oriented autoresearch runtime for Codex: one mission in, persistent execution out.

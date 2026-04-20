@@ -14,7 +14,7 @@ import textwrap
 import time
 import uuid
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from string import Template
 from typing import Any
@@ -25,19 +25,30 @@ TEMPLATES_DIR = PROJECT_ROOT / "templates"
 SCHEMA_PATH = PROJECT_ROOT / "schemas" / "agent_response.schema.json"
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_FALLBACK_MODEL = "gpt-5.3-codex-spark"
-DEFAULT_INTERVAL_SECONDS = 600
+DEFAULT_INTERVAL_SECONDS = 3600
 DEFAULT_LARK_POLL_INTERVAL_SECONDS = 7200
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 7200
+MIN_SLEEP_SECONDS = 30
+MAX_SLEEP_SECONDS = 3600
 MAX_INPUT_EXCERPT_CHARS = 6000
+MAX_LOG_ESTIMATE_LINES = 400
 SYSTEM_SECTION_PREFIX = "Autoresearch System:"
 MODE_RECENT_EVENT_LIMIT = 8
 DEFAULT_RUNTIME_DIRNAME = "auto-codex"
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM}
 GLOBAL_STOP_REQUESTED = False
+JOB_TERMINAL_STATUSES = {"completed", "succeeded", "success", "done", "cancelled", "stopped"}
+JOB_ATTENTION_STATUSES = {"failed", "error", "timeout", "oom", "not_in_queue"}
+JOB_RUNNING_STATUSES = {"submitted", "queued", "pending", "running", "r", "pd"}
+MAX_FOCUSED_JOB_COUNT = 5
 
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def iso_after_seconds(seconds: int) -> str:
+    return (datetime.now().astimezone() + timedelta(seconds=max(0, seconds))).isoformat(timespec="seconds")
 
 
 def slugify(value: str) -> str:
@@ -138,6 +149,7 @@ def ensure_runtime_layout(runtime_dir: Path) -> dict[str, Path]:
         "runtime": runtime_dir,
         "state": runtime_dir / "state.json",
         "plan": runtime_dir / "plan.json",
+        "plan_preview": runtime_dir / "plan.preview.json",
         "events": runtime_dir / "events.jsonl",
         "inputs": runtime_dir / "inputs.jsonl",
         "mission": runtime_dir / "mission.md",
@@ -199,13 +211,52 @@ def default_state(
             "paused": False,
         },
         "progress": {
-            "summary": "Runtime initialized.",
+            "summary": "Plan preview generated. Waiting for confirmation before execution.",
             "last_worker_status": "",
             "artifacts_updated": [],
             "next_sleep_seconds": DEFAULT_INTERVAL_SECONDS,
+            "sleep_reason": "Default one-hour polling interval.",
+            "planned_wake_at": "",
+        },
+        "execution": {
+            "current_phase": {
+                "title": "",
+                "goal": "",
+                "related_plan_step": "",
+                "related_job_ids": [],
+                "status": "",
+            },
+            "phase_plan": [],
+            "next_action": {
+                "summary": "",
+                "reason": "",
+                "primary_target": "",
+                "resume_targets": [],
+                "search_patterns": [],
+                "read_ladder": [],
+                "success_condition": "",
+                "fallback_if_missing": "",
+            },
+            "updated_at": created_at,
         },
         "plan": {
-            "items": plan_steps,
+            "items": [],
+        },
+        "planning": {
+            "preview": {
+                "version": 1,
+                "items": deepcopy(plan_steps),
+                "generated_at": created_at,
+                "source": "mission_seeded",
+                "approved": False,
+                "approved_at": "",
+                "revision_note": "",
+            },
+            "current": {
+                "version": 0,
+                "items": [],
+                "approved_at": "",
+            },
         },
         "jobs": {},
         "history": {
@@ -240,6 +291,9 @@ def render_worker_prompt(runtime_dir: Path, state: dict[str, Any]) -> str:
             f"- {item['id']} | {item['source']} | {item['created_at']}{title}\n  {truncate_text(item.get('content', ''), 240)}"
         )
     pending_inputs_summary = "\n".join(pending_summary_lines) if pending_summary_lines else "- none"
+    focused_job_ids = select_focused_job_ids(runtime_dir, state)
+    focused_jobs_path = write_focused_jobs_markdown(runtime_dir, state, focused_job_ids)
+    focused_job_ids_text = ", ".join(focused_job_ids) if focused_job_ids else "none"
 
     template = load_template("worker_prompt.md.tmpl")
     return template.substitute(
@@ -249,6 +303,9 @@ def render_worker_prompt(runtime_dir: Path, state: dict[str, Any]) -> str:
         plan_path=str(runtime_dir / "plan.json"),
         pending_inputs_path=str(pending_inputs_path),
         pending_inputs_summary=pending_inputs_summary,
+        resume_status_path=str(runtime_dir / "notes" / "resume_status.md"),
+        focused_jobs_path=str(focused_jobs_path),
+        focused_job_ids=focused_job_ids_text,
         jobs_dir=str(runtime_dir / "jobs"),
         notes_dir=str(runtime_dir / "notes"),
         outbox_dir=str(runtime_dir / "outbox"),
@@ -286,7 +343,9 @@ def ensure_state_defaults(state: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("lifecycle", {})
     state.setdefault("supervisor", {})
     state.setdefault("progress", {})
+    state.setdefault("execution", {})
     state.setdefault("plan", {"items": []})
+    state.setdefault("planning", {})
     state.setdefault("jobs", {})
     state.setdefault("history", {})
     state.setdefault("inputs", {})
@@ -298,6 +357,8 @@ def ensure_state_defaults(state: dict[str, Any]) -> dict[str, Any]:
     state["lifecycle"].setdefault("stop_requested", False)
     state["lifecycle"].setdefault("stop_reason", "")
     state["lifecycle"].setdefault("completed_at", "")
+    if state["lifecycle"].get("status") == "initialized" and not state.get("plan", {}).get("items"):
+        state["lifecycle"]["status"] = "awaiting_plan_confirmation"
 
     state["supervisor"].setdefault("active_model", DEFAULT_MODEL)
     state["supervisor"].setdefault("fallback_model", DEFAULT_FALLBACK_MODEL)
@@ -310,6 +371,52 @@ def ensure_state_defaults(state: dict[str, Any]) -> dict[str, Any]:
     state["progress"].setdefault("last_worker_status", "")
     state["progress"].setdefault("artifacts_updated", [])
     state["progress"].setdefault("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS)
+    state["progress"].setdefault("sleep_reason", "")
+    state["progress"].setdefault("planned_wake_at", "")
+
+    execution = state["execution"]
+    current_phase = execution.setdefault("current_phase", {})
+    current_phase.setdefault("title", "")
+    current_phase.setdefault("goal", "")
+    current_phase.setdefault("related_plan_step", "")
+    current_phase.setdefault("related_job_ids", [])
+    current_phase.setdefault("status", "")
+    execution.setdefault("phase_plan", [])
+    next_action = execution.setdefault("next_action", {})
+    next_action.setdefault("summary", "")
+    next_action.setdefault("reason", "")
+    next_action.setdefault("primary_target", "")
+    next_action.setdefault("resume_targets", [])
+    next_action.setdefault("search_patterns", [])
+    next_action.setdefault("read_ladder", [])
+    next_action.setdefault("success_condition", "")
+    next_action.setdefault("fallback_if_missing", "")
+    execution.setdefault("updated_at", "")
+
+    planning = state["planning"]
+    preview = planning.setdefault("preview", {})
+    current = planning.setdefault("current", {})
+    preview.setdefault("version", 1)
+    preview.setdefault("items", [])
+    preview.setdefault("generated_at", "")
+    preview.setdefault("source", "mission_seeded")
+    preview.setdefault("approved", False)
+    preview.setdefault("approved_at", "")
+    preview.setdefault("revision_note", "")
+    current.setdefault("version", 0)
+    current.setdefault("items", [])
+    current.setdefault("approved_at", "")
+
+    # Migrate older runtimes that only stored a single state["plan"].
+    if not current["items"] and state.get("plan", {}).get("items"):
+        current["items"] = deepcopy(state["plan"]["items"])
+        if current["version"] <= 0:
+            current["version"] = 1
+        if not current["approved_at"]:
+            current["approved_at"] = state["lifecycle"].get("updated_at", "")
+    if not preview["items"] and not current["items"] and state.get("plan", {}).get("items"):
+        preview["items"] = deepcopy(state["plan"]["items"])
+    state["plan"] = {"items": deepcopy(current["items"])}
 
     state["inputs"].setdefault("total", 0)
     state["inputs"].setdefault("pending", 0)
@@ -328,7 +435,8 @@ def ensure_state_defaults(state: dict[str, Any]) -> dict[str, Any]:
 
 def write_plan_markdown(runtime_dir: Path, state: dict[str, Any]) -> None:
     lines = ["# Current Plan", "", f"Updated: {now_iso()}", ""]
-    for item in state.get("plan", {}).get("items", []):
+    current_items = state.get("planning", {}).get("current", {}).get("items", state.get("plan", {}).get("items", []))
+    for item in current_items:
         status = item.get("status", "pending")
         step = item.get("step", "")
         lines.append(f"- [{status}] {step}")
@@ -336,16 +444,109 @@ def write_plan_markdown(runtime_dir: Path, state: dict[str, Any]) -> None:
     write_text(runtime_dir / "notes" / "plan.md", "\n".join(lines))
 
 
+def write_plan_preview_markdown(runtime_dir: Path, state: dict[str, Any]) -> None:
+    preview = state.get("planning", {}).get("preview", {})
+    lines = [
+        "# Plan Preview",
+        "",
+        f"Updated: {now_iso()}",
+        f"Version: {preview.get('version', 1)}",
+        "",
+    ]
+    if preview.get("revision_note"):
+        lines.extend(["## Latest Revision Note", "", preview["revision_note"], ""])
+    lines.extend(["## Proposed Steps", ""])
+    for item in preview.get("items", []):
+        status = item.get("status", "pending")
+        step = item.get("step", "")
+        lines.append(f"- [{status}] {step}")
+    if not preview.get("items"):
+        lines.append("- none")
+    lines.append("")
+    write_text(runtime_dir / "notes" / "plan_preview.md", "\n".join(lines))
+
+
+def write_execution_markdown(runtime_dir: Path, state: dict[str, Any]) -> None:
+    execution = state.get("execution", {})
+    current_phase = execution.get("current_phase", {})
+    next_action = execution.get("next_action", {})
+    progress = state.get("progress", {})
+    lines = [
+        "# Resume Status",
+        "",
+        f"Updated: {execution.get('updated_at', now_iso())}",
+        "",
+        "## Current Phase",
+        "",
+        f"- title: {current_phase.get('title', '') or 'none'}",
+        f"- goal: {current_phase.get('goal', '') or 'none'}",
+        f"- related_plan_step: {current_phase.get('related_plan_step', '') or 'none'}",
+        f"- status: {current_phase.get('status', '') or 'none'}",
+        "",
+        "## Phase Plan",
+        "",
+    ]
+    phase_plan = execution.get("phase_plan", [])
+    if phase_plan:
+        lines.extend(f"- {item}" for item in phase_plan)
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "## Next Action",
+            "",
+            f"- summary: {next_action.get('summary', '') or 'none'}",
+            f"- reason: {next_action.get('reason', '') or 'none'}",
+            f"- primary_target: {next_action.get('primary_target', '') or 'none'}",
+            f"- sleep_hint: {(progress.get('sleep_reason', '') or 'none')}",
+            f"- success_condition: {next_action.get('success_condition', '') or 'none'}",
+            f"- fallback_if_missing: {next_action.get('fallback_if_missing', '') or 'none'}",
+            "",
+            "### Resume Targets",
+            "",
+        ]
+    )
+    resume_targets = next_action.get("resume_targets", [])
+    if resume_targets:
+        lines.extend(f"- {item}" for item in resume_targets)
+    else:
+        lines.append("- none")
+    lines.extend(["", "### Search Patterns", ""])
+    search_patterns = next_action.get("search_patterns", [])
+    if search_patterns:
+        lines.extend(f"- {item}" for item in search_patterns)
+    else:
+        lines.append("- none")
+    lines.extend(["", "### Read Ladder", ""])
+    read_ladder = next_action.get("read_ladder", [])
+    if read_ladder:
+        lines.extend(f"- {item}" for item in read_ladder)
+    else:
+        lines.append("- none")
+    lines.append("")
+    write_text(runtime_dir / "notes" / "resume_status.md", "\n".join(lines))
+
+
 def save_state(runtime_dir: Path, state: dict[str, Any]) -> None:
     state = ensure_state_defaults(state)
+    merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=True)
+    state["execution"]["current_phase"]["status"] = state["lifecycle"].get("status", "")
     state["lifecycle"]["updated_at"] = now_iso()
+    state["plan"] = {"items": deepcopy(state.get("planning", {}).get("current", {}).get("items", []))}
     write_json(runtime_dir / "state.json", state)
     write_json(runtime_dir / "plan.json", state.get("plan", {"items": []}))
+    write_json(runtime_dir / "plan.preview.json", state.get("planning", {}).get("preview", {"items": []}))
     write_plan_markdown(runtime_dir, state)
+    write_plan_preview_markdown(runtime_dir, state)
+    write_execution_markdown(runtime_dir, state)
 
 
 def load_state(runtime_dir: Path) -> dict[str, Any]:
-    return ensure_state_defaults(read_json(runtime_dir / "state.json"))
+    state = ensure_state_defaults(read_json(runtime_dir / "state.json"))
+    merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=True)
+    state["execution"]["current_phase"]["status"] = state["lifecycle"].get("status", "")
+    return state
 
 
 def load_inputs(runtime_dir: Path) -> list[dict[str, Any]]:
@@ -435,8 +636,541 @@ def summarize_jobs(state: dict[str, Any], limit: int = 10) -> list[str]:
     return lines or ["- none"]
 
 
+def current_plan_items(state: dict[str, Any]) -> list[dict[str, str]]:
+    return deepcopy(state.get("planning", {}).get("current", {}).get("items", state.get("plan", {}).get("items", [])))
+
+
+def preview_plan_items(state: dict[str, Any]) -> list[dict[str, str]]:
+    return deepcopy(state.get("planning", {}).get("preview", {}).get("items", []))
+
+
+def set_current_plan_items(state: dict[str, Any], items: list[dict[str, str]]) -> None:
+    state["planning"]["current"]["items"] = deepcopy(items)
+    state["plan"]["items"] = deepcopy(items)
+
+
+def set_preview_plan_items(state: dict[str, Any], items: list[dict[str, str]], source: str, revision_note: str = "") -> None:
+    preview = state["planning"]["preview"]
+    preview["version"] = int(preview.get("version", 0)) + 1
+    preview["items"] = deepcopy(items)
+    preview["generated_at"] = now_iso()
+    preview["source"] = source
+    preview["approved"] = False
+    preview["approved_at"] = ""
+    preview["revision_note"] = revision_note.strip()
+
+
+def lifecycle_plan_items(state: dict[str, Any]) -> list[dict[str, str]]:
+    if state.get("lifecycle", {}).get("status") == "awaiting_plan_confirmation":
+        return preview_plan_items(state)
+    return current_plan_items(state)
+
+
+def active_plan_item(state: dict[str, Any]) -> tuple[int, dict[str, str] | None]:
+    items = lifecycle_plan_items(state)
+    if not items:
+        return -1, None
+    for index, item in enumerate(items):
+        if item.get("status") != "completed":
+            return index, item
+    return len(items) - 1, items[-1]
+
+
+def looks_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return len(value) == 0
+    if isinstance(value, dict):
+        return len(value) == 0 or all(looks_missing(item) for item in value.values())
+    return False
+
+
+def clamp_sleep_seconds(value: int | float) -> int:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = DEFAULT_INTERVAL_SECONDS
+    return max(MIN_SLEEP_SECONDS, min(MAX_SLEEP_SECONDS, seconds))
+
+
+def tail_lines(path: Path, max_lines: int) -> list[str]:
+    if not path.exists() or not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return []
+    return [line.rstrip("\n") for line in lines[-max_lines:]]
+
+
+def expand_metric_number(raw: str) -> int:
+    cleaned = raw.strip().lower().replace(",", "")
+    multiplier = 1
+    if cleaned.endswith("k"):
+        multiplier = 1000
+        cleaned = cleaned[:-1]
+    try:
+        return int(float(cleaned) * multiplier)
+    except ValueError:
+        return 0
+
+
+def extract_target_steps(texts: list[str]) -> list[int]:
+    targets: list[int] = []
+    patterns = [
+        re.compile(r"\b(\d+(?:\.\d+)?)\s*k\b", re.IGNORECASE),
+        re.compile(r"\b(\d{4,7})\b"),
+        re.compile(r"\beval(?:uate|uation)?\s+every\s+(\d+(?:\.\d+)?)(k)?\s*(?:steps?|iters?|iterations?)", re.IGNORECASE),
+        re.compile(r"\bevery\s+(\d+(?:\.\d+)?)(k)?\s*(?:steps?|iters?|iterations?)", re.IGNORECASE),
+    ]
+    for text in texts:
+        if not text:
+            continue
+        for match in patterns[0].finditer(text):
+            value = expand_metric_number(match.group(1) + "k")
+            if value >= 1000 and value not in targets:
+                targets.append(value)
+        for match in patterns[1].finditer(text):
+            value = expand_metric_number(match.group(1))
+            if value >= 1000 and value not in targets:
+                targets.append(value)
+        for pattern in patterns[2:]:
+            for match in pattern.finditer(text):
+                raw = match.group(1) + ("k" if match.lastindex and match.group(2) else "")
+                value = expand_metric_number(raw)
+                if value >= 10 and value not in targets:
+                    targets.append(value)
+    return sorted(targets)
+
+
+def extract_current_step(lines: list[str]) -> int:
+    step_patterns = [
+        re.compile(r"\b(?:step|steps|iter|iteration|global[_ -]?step)\b[^0-9]{0,12}(\d{1,7})", re.IGNORECASE),
+        re.compile(r"\b(\d{1,7})\s*/\s*(\d{1,7})\b"),
+        re.compile(r"\bglobal[_ -]?step\s*[=:]\s*(\d{1,7})", re.IGNORECASE),
+        re.compile(r"\biteration\s*[=:]?\s*(\d{1,7})\b", re.IGNORECASE),
+    ]
+    best = 0
+    for line in lines:
+        for pattern in step_patterns:
+            match = pattern.search(line)
+            if not match:
+                continue
+            value = int(match.group(1))
+            if value > best:
+                best = value
+    return best
+
+
+def extract_seconds_per_iter(lines: list[str]) -> float:
+    patterns = [
+        re.compile(r"(\d+(?:\.\d+)?)\s*s/it\b", re.IGNORECASE),
+        re.compile(r"(\d+(?:\.\d+)?)\s*sec(?:onds)?/it\b", re.IGNORECASE),
+        re.compile(r"(?:iter(?:ation)?[_ -]?time|time per iter(?:ation)?)\s*[=:]?\s*(\d+(?:\.\d+)?)\s*s\b", re.IGNORECASE),
+        re.compile(r"(?:samples/sec|tokens/sec)[^0-9]{0,12}(\d+(?:\.\d+)?)", re.IGNORECASE),
+        re.compile(r"it/s[^0-9]{0,8}(\d+(?:\.\d+)?)", re.IGNORECASE),
+        re.compile(r"(\d+(?:\.\d+)?)\s*it/s\b", re.IGNORECASE),
+    ]
+    candidates: list[float] = []
+    for line in lines:
+        lowered = line.lower()
+        for index, pattern in enumerate(patterns):
+            match = pattern.search(lowered)
+            if not match:
+                continue
+            value = float(match.group(1))
+            if index == 3:
+                # samples/sec or tokens/sec alone are not enough to infer iteration time.
+                continue
+            if index in {4, 5}:
+                if value > 0:
+                    candidates.append(1.0 / value)
+            else:
+                candidates.append(value)
+    return candidates[-1] if candidates else 0.0
+
+
+def infer_target_step(current_step: int, candidate_texts: list[str]) -> int:
+    targets = extract_target_steps(candidate_texts)
+    larger_targets = [value for value in targets if value > current_step]
+    if larger_targets:
+        return min(larger_targets)
+
+    interval_patterns = [
+        re.compile(r"\beval(?:uate|uation)?\s+every\s+(\d+(?:\.\d+)?)(k)?\s*(?:steps?|iters?|iterations?)", re.IGNORECASE),
+        re.compile(r"\bevery\s+(\d+(?:\.\d+)?)(k)?\s*(?:steps?|iters?|iterations?)", re.IGNORECASE),
+    ]
+    for text in candidate_texts:
+        for pattern in interval_patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            raw = match.group(1) + ("k" if match.lastindex and match.group(2) else "")
+            interval = expand_metric_number(raw)
+            if interval > 0 and current_step > 0:
+                return ((current_step // interval) + 1) * interval
+    return 0
+
+
+def infer_primary_log_path(runtime_dir: Path, state: dict[str, Any]) -> Path | None:
+    def resolve_candidate(raw: str) -> Path | None:
+        direct = Path(raw).expanduser()
+        if direct.exists() and direct.is_file():
+            return direct.resolve()
+        if not direct.is_absolute():
+            nested = (runtime_dir / direct).resolve()
+            if nested.exists() and nested.is_file():
+                return nested
+            name_only = (runtime_dir / direct.name).resolve()
+            if name_only.exists() and name_only.is_file():
+                return name_only
+        return None
+
+    next_action = state.get("execution", {}).get("next_action", {})
+    candidates: list[str] = []
+    for job_id in select_focused_job_ids(runtime_dir, state):
+        metadata = state.get("jobs", {}).get(job_id, {})
+        if metadata.get("log_out"):
+            candidates.append(str(metadata.get("log_out")))
+        if metadata.get("log_err"):
+            candidates.append(str(metadata.get("log_err")))
+    if next_action.get("primary_target"):
+        candidates.append(str(next_action.get("primary_target")))
+    for item in next_action.get("resume_targets", []):
+        candidates.append(str(item))
+    for raw in candidates:
+        resolved = resolve_candidate(raw)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def estimate_sleep_from_logs(runtime_dir: Path, state: dict[str, Any]) -> tuple[int, str] | None:
+    log_path = infer_primary_log_path(runtime_dir, state)
+    if log_path is None:
+        return None
+    lines = tail_lines(log_path, MAX_LOG_ESTIMATE_LINES)
+    if not lines:
+        return None
+
+    seconds_per_iter = extract_seconds_per_iter(lines)
+    current_step = extract_current_step(lines)
+    next_action = state.get("execution", {}).get("next_action", {})
+    candidate_texts = [
+        str(next_action.get("summary", "")),
+        str(next_action.get("reason", "")),
+        str(next_action.get("success_condition", "")),
+    ]
+    candidate_texts.extend(str(item) for item in next_action.get("search_patterns", []))
+    target_step = infer_target_step(current_step, candidate_texts)
+    if seconds_per_iter <= 0 or current_step <= 0 or target_step <= current_step:
+        return None
+    remaining_steps = max(0, target_step - current_step)
+    if remaining_steps <= 0:
+        return None
+
+    estimated_seconds = int(remaining_steps * seconds_per_iter)
+    recommended_sleep = clamp_sleep_seconds(estimated_seconds)
+    reason = (
+        f"Estimated {estimated_seconds}s until step {target_step} from step {current_step} "
+        f"using {seconds_per_iter:.3f}s/it from {log_path}; capped to {recommended_sleep}s."
+    )
+    return recommended_sleep, reason
+
+
+def choose_sleep_policy(runtime_dir: Path, state: dict[str, Any], worker_result: dict[str, Any]) -> tuple[int, str]:
+    worker_status = worker_result.get("status", "")
+    worker_sleep = clamp_sleep_seconds(worker_result.get("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS))
+    worker_reason = str(worker_result.get("sleep_reason", "")).strip()
+
+    if worker_status != "waiting_job":
+        if not worker_reason:
+            worker_reason = "Use the worker-provided cadence, capped at the one-hour maximum."
+        return worker_sleep, worker_reason
+
+    helper_estimate = estimate_sleep_from_logs(runtime_dir, state)
+    if helper_estimate is not None:
+        helper_sleep, helper_reason = helper_estimate
+        if not worker_reason or worker_sleep >= DEFAULT_INTERVAL_SECONDS:
+            return helper_sleep, helper_reason
+        if helper_sleep < worker_sleep:
+            return helper_sleep, f"{helper_reason} Worker requested {worker_sleep}s; using the earlier checkpoint."
+
+    if not worker_reason:
+        worker_reason = "No reliable runtime estimate was returned; fall back to the default one-hour polling interval."
+    return worker_sleep, worker_reason
+
+
+def job_status_bucket(status: str) -> int:
+    lowered = status.strip().lower()
+    if lowered in JOB_ATTENTION_STATUSES:
+        return 0
+    if lowered in JOB_RUNNING_STATUSES:
+        return 1
+    if lowered in JOB_TERMINAL_STATUSES:
+        return 3
+    return 2
+
+
+def iso_timestamp_rank(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def job_sort_key(metadata: dict[str, Any]) -> tuple[int, float, float]:
+    status = str(metadata.get("status", ""))
+    last_seen = str(metadata.get("last_seen_at", ""))
+    submitted = str(metadata.get("submitted_at", ""))
+    return (job_status_bucket(status), -iso_timestamp_rank(last_seen or submitted), -iso_timestamp_rank(submitted))
+
+
+def extract_referenced_job_ids(state: dict[str, Any], runtime_dir: Path) -> list[str]:
+    known = list(state.get("jobs", {}).keys())
+    if not known:
+        return []
+    text_parts = [state.get("progress", {}).get("summary", "")]
+    text_parts.extend(item.get("step", "") for item in current_plan_items(state))
+    text_parts.extend(item.get("step", "") for item in preview_plan_items(state))
+    for item in load_inputs(runtime_dir):
+        if item.get("status") == "pending":
+            text_parts.append(item.get("title", ""))
+            text_parts.append(item.get("content", ""))
+    joined = "\n".join(part for part in text_parts if part)
+    found: list[str] = []
+    for job_id in known:
+        if job_id and job_id in joined and job_id not in found:
+            found.append(job_id)
+    return found
+
+
+def select_focused_job_ids(runtime_dir: Path, state: dict[str, Any], limit: int = MAX_FOCUSED_JOB_COUNT) -> list[str]:
+    jobs = state.get("jobs", {})
+    if not jobs:
+        return []
+
+    chosen: list[str] = []
+    referenced = extract_referenced_job_ids(state, runtime_dir)
+    for job_id in referenced:
+        if job_id in jobs and job_id not in chosen:
+            chosen.append(job_id)
+
+    active_sorted = sorted(jobs.items(), key=lambda item: job_sort_key(item[1]))
+    for job_id, metadata in active_sorted:
+        status = str(metadata.get("status", "")).strip().lower()
+        if status in JOB_TERMINAL_STATUSES:
+            continue
+        if job_id not in chosen:
+            chosen.append(job_id)
+        if len(chosen) >= limit:
+            break
+
+    if not chosen:
+        for job_id, _metadata in active_sorted[:limit]:
+            chosen.append(job_id)
+    return chosen[:limit]
+
+
+def write_focused_jobs_markdown(runtime_dir: Path, state: dict[str, Any], focused_job_ids: list[str]) -> Path:
+    path = runtime_dir / "notes" / "jobs_focus.md"
+    lines = [
+        "# Focused Jobs",
+        "",
+        f"Updated: {now_iso()}",
+        "",
+        "Read this file first. Only open detailed job JSON files or logs for these focused jobs unless new evidence makes a different job necessary.",
+        "",
+    ]
+    if not focused_job_ids:
+        lines.extend(["- none", ""])
+        write_text(path, "\n".join(lines))
+        return path
+
+    for job_id in focused_job_ids:
+        metadata = state.get("jobs", {}).get(job_id, {})
+        lines.append(f"## Job {job_id}")
+        lines.append("")
+        lines.append(f"- status: {metadata.get('status', 'unknown')}")
+        if metadata.get("script"):
+            lines.append(f"- script: {metadata.get('script')}")
+        if metadata.get("submitted_at"):
+            lines.append(f"- submitted_at: {metadata.get('submitted_at')}")
+        if metadata.get("last_seen_at"):
+            lines.append(f"- last_seen_at: {metadata.get('last_seen_at')}")
+        if metadata.get("queue_time"):
+            lines.append(f"- queue_time: {metadata.get('queue_time')}")
+        if metadata.get("log_out"):
+            lines.append(f"- log_out: {metadata.get('log_out')}")
+        if metadata.get("log_err"):
+            lines.append(f"- log_err: {metadata.get('log_err')}")
+        if metadata.get("notes"):
+            lines.append(f"- notes: {truncate_text(str(metadata.get('notes', '')), 240)}")
+        lines.append("")
+    write_text(path, "\n".join(lines))
+    return path
+
+
+def derive_phase_title(step: str, lifecycle: str) -> str:
+    cleaned = step.strip()
+    if cleaned:
+        return truncate_text(cleaned, 120)
+    if lifecycle == "awaiting_plan_confirmation":
+        return "Plan confirmation"
+    if lifecycle == "waiting_job":
+        return "Job verification"
+    if lifecycle == "blocked":
+        return "Blocker resolution"
+    return "Execution"
+
+
+def derive_execution_defaults(runtime_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    lifecycle = state.get("lifecycle", {}).get("status", "")
+    phase_index, phase_item = active_plan_item(state)
+    phase_step = phase_item.get("step", "").strip() if phase_item else ""
+    focused_job_ids = select_focused_job_ids(runtime_dir, state)
+    primary_job_id = focused_job_ids[0] if focused_job_ids else ""
+    primary_job = state.get("jobs", {}).get(primary_job_id, {}) if primary_job_id else {}
+    primary_target = str(primary_job.get("log_out") or primary_job.get("log_err") or (runtime_dir / "notes" / "jobs_focus.md"))
+
+    if lifecycle == "awaiting_plan_confirmation":
+        return {
+            "current_phase": {
+                "title": "Plan confirmation",
+                "goal": "Review the proposed plan and confirm that the first execution step is correct before any work starts.",
+                "related_plan_step": phase_step,
+                "related_job_ids": [],
+                "status": lifecycle,
+            },
+            "phase_plan": [
+                "Read notes/plan_preview.md and compare it against mission constraints.",
+                "Adjust priorities or boundaries if the next execution step is not the best one.",
+                "Approve the plan only when the immediate next step is clear.",
+            ],
+            "next_action": {
+                "summary": "Review the proposed plan and either approve it or revise it before execution starts.",
+                "reason": "Execution is intentionally gated on plan confirmation.",
+                "primary_target": str(runtime_dir / "notes" / "plan_preview.md"),
+                "resume_targets": [
+                    str(runtime_dir / "mission.md"),
+                    str(runtime_dir / "notes" / "plan_preview.md"),
+                ],
+                "search_patterns": [],
+                "read_ladder": [
+                    "Read notes/plan_preview.md.",
+                    "Cross-check the preview against mission.md constraints and priorities.",
+                    "Approve the plan or revise it with a precise note.",
+                ],
+                "success_condition": "The plan is approved or a revised preview is saved with a clearer first step.",
+                "fallback_if_missing": "If the preview is too vague, revise it before allowing execution.",
+            },
+        }
+
+    if lifecycle == "waiting_job" or primary_job_id:
+        return {
+            "current_phase": {
+                "title": derive_phase_title(phase_step, "waiting_job"),
+                "goal": f"Verify the outcome of the current job path and decide whether the latest change worked{f' for job {primary_job_id}' if primary_job_id else ''}.",
+                "related_plan_step": phase_step,
+                "related_job_ids": focused_job_ids,
+                "status": lifecycle or "waiting_job",
+            },
+            "phase_plan": [
+                f"Inspect the focused job summary first: {runtime_dir / 'notes' / 'jobs_focus.md'}.",
+                f"Search the primary job output for the expected signal before reading larger chunks{f' ({primary_job_id})' if primary_job_id else ''}.",
+                "If the signal is missing, widen the read budget step by step and only then expand to other jobs.",
+            ],
+            "next_action": {
+                "summary": f"Check whether the expected signal has appeared in the current job output{f' for job {primary_job_id}' if primary_job_id else ''}.",
+                "reason": "A waiting job should be inspected with precise retrieval before broader log reading.",
+                "primary_target": primary_target,
+                "resume_targets": [str(runtime_dir / "notes" / "jobs_focus.md")] + ([primary_target] if primary_target else []),
+                "search_patterns": ["10k", "10000", "eval", "eval loss", "validation"],
+                "read_ladder": [
+                    "Run rg on the primary target for the expected signal and nearby keywords.",
+                    "If there is no match, read the last 20 lines of the target log.",
+                    "If still unclear, read the last 200 lines or a narrow local window around related matches.",
+                    "Only then read the whole target log, and only after that expand to other jobs.",
+                ],
+                "success_condition": "You can confirm whether the expected metric or failure signal appeared in the target job output.",
+                "fallback_if_missing": "If the focused job still gives no answer, expand to the remaining focused jobs before scanning the full jobs directory.",
+            },
+        }
+
+    return {
+        "current_phase": {
+            "title": derive_phase_title(phase_step, lifecycle),
+            "goal": phase_step or "Continue the highest-priority remaining execution phase.",
+            "related_plan_step": phase_step,
+            "related_job_ids": focused_job_ids,
+            "status": lifecycle or "running",
+        },
+        "phase_plan": [
+            f"Continue the active plan step: {phase_step or 'pick the highest-priority remaining step.'}",
+            "Keep the recovery packet up to date so the next resume can act without broad rereading.",
+            "Only widen context beyond the focused jobs or files if the current step clearly needs it.",
+        ],
+        "next_action": {
+            "summary": f"Continue the active phase by executing the next concrete chunk of work{f': {phase_step}' if phase_step else '.'}",
+            "reason": "The runtime should resume from the smallest actionable step rather than re-planning from scratch.",
+            "primary_target": str(runtime_dir / "notes" / "latest_summary.md"),
+            "resume_targets": [
+                str(runtime_dir / "notes" / "latest_summary.md"),
+                str(runtime_dir / "plan.json"),
+                str(runtime_dir / "notes" / "jobs_focus.md"),
+            ],
+            "search_patterns": [],
+            "read_ladder": [
+                "Read latest_summary.md and the current plan first.",
+                "Open only the files or jobs directly required by the active phase.",
+                "Update the recovery packet before ending the tick.",
+            ],
+            "success_condition": "The active plan step advances and the next resume point becomes more specific.",
+            "fallback_if_missing": "If the active step is ambiguous, tighten the phase plan and next action packet before continuing.",
+        },
+    }
+
+
+def merge_execution_packet(runtime_dir: Path, state: dict[str, Any], packet: dict[str, Any], overwrite_missing_only: bool = False) -> None:
+    execution = state.setdefault("execution", {})
+    derived = derive_execution_defaults(runtime_dir, state)
+    source = deepcopy(packet) if packet else {}
+
+    for section_name in ("current_phase", "next_action"):
+        target_section = execution.setdefault(section_name, {})
+        source_section = source.get(section_name, {}) if isinstance(source.get(section_name, {}), dict) else {}
+        derived_section = derived[section_name]
+        for key, fallback_value in derived_section.items():
+            value = source_section.get(key)
+            if overwrite_missing_only:
+                if looks_missing(target_section.get(key)):
+                    target_section[key] = deepcopy(value if not looks_missing(value) else fallback_value)
+            else:
+                target_section[key] = deepcopy(value if not looks_missing(value) else fallback_value)
+
+    source_phase_plan = source.get("phase_plan", []) if isinstance(source.get("phase_plan", []), list) else []
+    if overwrite_missing_only:
+        if looks_missing(execution.get("phase_plan")):
+            execution["phase_plan"] = deepcopy(source_phase_plan if source_phase_plan else derived["phase_plan"])
+    else:
+        execution["phase_plan"] = deepcopy(source_phase_plan if source_phase_plan else derived["phase_plan"])
+
+    execution["updated_at"] = now_iso()
+
+
 def summarize_plan(state: dict[str, Any], limit: int = 8) -> list[str]:
-    lines = [f"- [{item.get('status', 'pending')}] {item.get('step', '')}" for item in state.get("plan", {}).get("items", [])[:limit]]
+    lines = [f"- [{item.get('status', 'pending')}] {item.get('step', '')}" for item in current_plan_items(state)[:limit]]
+    return lines or ["- none"]
+
+
+def summarize_preview_plan(state: dict[str, Any], limit: int = 8) -> list[str]:
+    lines = [f"- [{item.get('status', 'pending')}] {item.get('step', '')}" for item in preview_plan_items(state)[:limit]]
     return lines or ["- none"]
 
 
@@ -475,11 +1209,13 @@ def summarize_recent_events(runtime_dir: Path, limit: int = MODE_RECENT_EVENT_LI
 def infer_next_action(state: dict[str, Any], runtime_dir: Path) -> str:
     if state["supervisor"].get("paused"):
         return "Wait for `/autoresearch resume` before doing more work."
+    lifecycle = state["lifecycle"].get("status", "")
+    if lifecycle == "awaiting_plan_confirmation":
+        return "Review the proposed plan, then approve it or revise it before execution starts."
     pending = [item for item in load_inputs(runtime_dir) if item.get("status") == "pending"]
     if pending:
         newest = pending[0]
         return f"Consume pending input `{newest['id']}` and decide whether it changes the plan."
-    lifecycle = state["lifecycle"].get("status", "")
     if lifecycle == "waiting_job":
         return "Poll job state and logs, then resume execution when results are ready."
     if lifecycle == "blocked":
@@ -489,16 +1225,101 @@ def infer_next_action(state: dict[str, Any], runtime_dir: Path) -> str:
     return "Run the next highest-priority task from the current plan."
 
 
+def mission_heading_bullets(runtime_dir: Path, keywords: tuple[str, ...]) -> list[str]:
+    mission_path = runtime_dir / "mission.md"
+    if not mission_path.exists():
+        return []
+    markdown = read_text(mission_path)
+    headings = re.compile(r"^##\s+(.+)$")
+    ordered_item = re.compile(r"^\s*(?:[-*]|\d+\.)\s+(.+?)\s*$")
+    matches: list[str] = []
+    active = False
+    lowered_keywords = tuple(keyword.lower() for keyword in keywords)
+    for raw_line in markdown.splitlines():
+        stripped = raw_line.strip()
+        heading_match = headings.match(stripped)
+        if heading_match:
+            heading = heading_match.group(1).lower()
+            active = any(keyword in heading for keyword in lowered_keywords)
+            continue
+        if not active:
+            continue
+        item_match = ordered_item.match(raw_line)
+        if item_match:
+            matches.append(item_match.group(1))
+    return matches
+
+
+def render_plan_preview(runtime_dir: Path) -> str:
+    state = load_state(runtime_dir)
+    constraints = mission_heading_bullets(runtime_dir, ("constraint", "限制", "requirement", "要求"))
+    assumptions = mission_heading_bullets(runtime_dir, ("assumption", "假设"))
+    risks = mission_heading_bullets(runtime_dir, ("risk", "question", "open question", "风险", "问题"))
+    preview = state.get("planning", {}).get("preview", {})
+    if preview.get("revision_note"):
+        assumptions = assumptions + [f"Latest revision request: {preview['revision_note']}"]
+    if not assumptions:
+        assumptions = [
+            "No execution, daemon start, or cluster job submission should happen before plan approval.",
+            f"The runtime root defaults to {runtime_dir} unless the user explicitly chose another location.",
+        ]
+    if not constraints:
+        constraints = ["- none explicitly stated in the mission"]
+    else:
+        constraints = [f"- {item}" for item in constraints]
+    assumptions = [f"- {item}" for item in assumptions]
+    if not risks:
+        risks = [
+            "- The initial plan may need reprioritization after the first evidence pass.",
+            "- Any missing user preference should be clarified before expensive jobs are launched.",
+        ]
+    else:
+        risks = [f"- {item}" for item in risks]
+
+    sections = [
+        "**Auto-Codex Plan Preview**",
+        "",
+        "**Goal**",
+        state["mission"].get("title", Path(runtime_dir).name),
+        "",
+        "**Constraints**",
+        "\n".join(constraints),
+        "",
+        "**Assumptions**",
+        "\n".join(assumptions),
+        "",
+        "**Proposed Plan**",
+        "\n".join(summarize_preview_plan(state)),
+        "",
+        "**Risks / Open Questions**",
+        "\n".join(risks),
+        "",
+        "**Start Gate**",
+        "- Approve this plan to start execution.",
+        "- Revise this plan if priorities, constraints, or sequencing need to change first.",
+    ]
+    return "\n".join(sections).strip() + "\n"
+
+
 def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
     state = load_state(runtime_dir)
     goal = state["mission"].get("title", Path(runtime_dir).name)
     waiting_reason = state["lifecycle"].get("stop_reason", "").strip()
     lifecycle = "paused" if state["supervisor"].get("paused") else state["lifecycle"].get("status", "")
+    plan_heading = "**Current Plan**"
+    plan_lines = summarize_plan(state)
+    if lifecycle == "awaiting_plan_confirmation":
+        plan_heading = "**Proposed Plan**"
+        plan_lines = summarize_preview_plan(state)
 
     if lifecycle in {"waiting_job", "blocked"} and not waiting_reason:
         waiting_reason = state["progress"].get("summary", "").strip()
     if not waiting_reason:
         waiting_reason = "none"
+    execution = state.get("execution", {})
+    current_phase = execution.get("current_phase", {})
+    next_action = execution.get("next_action", {})
+    phase_plan = execution.get("phase_plan", [])
 
     header = "**Auto-Codex Sync**" if flavor == "sync" else "**Auto-Codex Status**"
     sections = [
@@ -507,16 +1328,28 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
         f"**Goal**",
         goal,
         "",
-        f"**Current Plan**",
-        "\n".join(summarize_plan(state)),
+        plan_heading,
+        "\n".join(plan_lines),
         "",
         f"**Latest Progress**",
         state["progress"].get("summary", "").strip() or "No progress recorded yet.",
+        "",
+        f"**Current Phase**",
+        f"- title: {current_phase.get('title', '') or 'none'}",
+        f"- goal: {current_phase.get('goal', '') or 'none'}",
+        f"- related step: {current_phase.get('related_plan_step', '') or 'none'}",
+        f"- related jobs: {', '.join(current_phase.get('related_job_ids', [])) or 'none'}",
+        "",
+        f"**Phase Plan**",
+        "\n".join(f"- {item}" for item in phase_plan) if phase_plan else "- none",
         "",
         f"**Waiting / Blockers**",
         f"- lifecycle: {lifecycle}",
         f"- reason: {waiting_reason}",
         f"- pending inputs: {state.get('inputs', {}).get('pending', 0)}",
+        f"- next sleep seconds: {state.get('progress', {}).get('next_sleep_seconds', DEFAULT_INTERVAL_SECONDS)}",
+        f"- sleep reason: {state.get('progress', {}).get('sleep_reason', '') or 'none'}",
+        f"- planned wake at: {state.get('progress', {}).get('planned_wake_at', '') or 'none'}",
         "",
         f"**Active Jobs**",
         "\n".join(summarize_jobs(state)),
@@ -528,7 +1361,13 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
         "\n".join(summarize_recent_events(runtime_dir)),
         "",
         f"**Next Action**",
-        infer_next_action(state, runtime_dir),
+        f"- summary: {next_action.get('summary', '') or infer_next_action(state, runtime_dir)}",
+        f"- reason: {next_action.get('reason', '') or 'none'}",
+        f"- primary target: {next_action.get('primary_target', '') or 'none'}",
+        f"- resume targets: {', '.join(next_action.get('resume_targets', [])) or 'none'}",
+        f"- search patterns: {', '.join(next_action.get('search_patterns', [])) or 'none'}",
+        f"- success condition: {next_action.get('success_condition', '') or 'none'}",
+        f"- fallback: {next_action.get('fallback_if_missing', '') or 'none'}",
     ]
     return "\n".join(sections).strip() + "\n"
 
@@ -548,13 +1387,19 @@ def make_input_item(source: str, content: str, title: str = "", author: str = "u
     }
 
 
-def record_summary(runtime_dir: Path, result: dict[str, Any]) -> None:
+def record_summary(runtime_dir: Path, state: dict[str, Any], result: dict[str, Any]) -> None:
+    current_phase = state.get("execution", {}).get("current_phase", {})
+    next_action = state.get("execution", {}).get("next_action", {})
     summary = textwrap.dedent(
         f"""\
         # Latest Summary
 
         Updated: {now_iso()}
         Worker status: {result.get("status", "unknown")}
+        Current phase: {current_phase.get("title", "") or "none"}
+        Next action: {next_action.get("summary", "") or "none"}
+        Planned sleep: {state.get("progress", {}).get("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS)}s
+        Sleep reason: {state.get("progress", {}).get("sleep_reason", "") or "none"}
 
         {result.get("summary", "").strip()}
         """
@@ -693,6 +1538,7 @@ def normalize_result(raw: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("status", "working")
     result.setdefault("summary", "")
     result.setdefault("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS)
+    result.setdefault("sleep_reason", "")
     result.setdefault("jobs_submitted", [])
     result.setdefault("artifacts_updated", [])
     result.setdefault("lark_update_markdown", "")
@@ -701,6 +1547,9 @@ def normalize_result(raw: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("plan_updates", [])
     result.setdefault("acknowledged_input_ids", [])
     result.setdefault("final_summary_markdown", "")
+    result.setdefault("current_phase", {})
+    result.setdefault("phase_plan", [])
+    result.setdefault("next_action", {})
     return result
 
 
@@ -829,7 +1678,7 @@ def merge_plan(state: dict[str, Any], plan_updates: list[dict[str, str]]) -> Non
             continue
         cleaned.append({"step": step, "status": status})
     if cleaned:
-        state["plan"]["items"] = cleaned
+        set_current_plan_items(state, cleaned)
 
 
 def sync_jobs_with_squeue(state: dict[str, Any], queue_snapshot: str) -> None:
@@ -953,7 +1802,8 @@ def maybe_poll_lark_inputs(runtime_dir: Path, state: dict[str, Any], disable_lar
 
 def generate_heartbeat_markdown(state: dict[str, Any]) -> str:
     plan_lines = []
-    for item in state.get("plan", {}).get("items", [])[:5]:
+    heartbeat_items = preview_plan_items(state) if state["lifecycle"].get("status") == "awaiting_plan_confirmation" else current_plan_items(state)
+    for item in heartbeat_items[:5]:
         plan_lines.append(f"- [{item.get('status', 'pending')}] {item.get('step', '')}")
     if not plan_lines:
         plan_lines.append("- none")
@@ -963,6 +1813,7 @@ def generate_heartbeat_markdown(state: dict[str, Any]) -> str:
         job_lines.append(f"- `{job_id}`: {metadata.get('status', 'unknown')}")
     if not job_lines:
         job_lines.append("- none")
+    next_action = state.get("execution", {}).get("next_action", {})
 
     return "\n".join(
         [
@@ -973,6 +1824,9 @@ def generate_heartbeat_markdown(state: dict[str, Any]) -> str:
             f"- Worker status: {state['progress'].get('last_worker_status', '')}",
             f"- Pending inputs: {state.get('inputs', {}).get('pending', 0)}",
             f"- Active model: {state['supervisor'].get('active_model', '')}",
+            f"- Next sleep seconds: {state['progress'].get('next_sleep_seconds', DEFAULT_INTERVAL_SECONDS)}",
+            f"- Sleep reason: {state['progress'].get('sleep_reason', '') or 'none'}",
+            f"- Planned wake at: {state['progress'].get('planned_wake_at', '') or 'none'}",
             "",
             "### Latest Summary",
             "",
@@ -985,6 +1839,10 @@ def generate_heartbeat_markdown(state: dict[str, Any]) -> str:
             "### Known Jobs",
             "",
             "\n".join(job_lines),
+            "",
+            "### Next Action",
+            "",
+            next_action.get("summary", "").strip() or "No next action recorded.",
             "",
         ]
     )
@@ -1045,6 +1903,9 @@ def invoke_codex_once(
 
 def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     state = load_state(runtime_dir)
+    if state["lifecycle"].get("status") == "awaiting_plan_confirmation":
+        append_event(runtime_dir, "tick_skipped", {"reason": "awaiting_plan_confirmation"})
+        return 0
     if state["lifecycle"].get("stop_requested"):
         append_event(runtime_dir, "tick_skipped", {"reason": "stop_requested"})
         return 0
@@ -1091,6 +1952,10 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     if worker_result is None:
         state["supervisor"]["consecutive_failures"] += 1
         state["progress"]["summary"] = "Codex tick failed."
+        state["progress"]["next_sleep_seconds"] = DEFAULT_INTERVAL_SECONDS
+        state["progress"]["sleep_reason"] = "Worker tick failed; fall back to the default one-hour polling interval."
+        state["progress"]["planned_wake_at"] = iso_after_seconds(DEFAULT_INTERVAL_SECONDS)
+        merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=False)
         append_event(runtime_dir, "tick_failed", {"model": used_model, "output": last_output[-4000:]})
         save_state(runtime_dir, state)
         return 1
@@ -1102,9 +1967,22 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     state["progress"]["summary"] = worker_result["summary"]
     state["progress"]["last_worker_status"] = worker_result["status"]
     state["progress"]["artifacts_updated"] = worker_result["artifacts_updated"]
-    state["progress"]["next_sleep_seconds"] = int(worker_result["next_sleep_seconds"])
+    sleep_seconds, sleep_reason = choose_sleep_policy(runtime_dir, state, worker_result)
+    state["progress"]["next_sleep_seconds"] = sleep_seconds
+    state["progress"]["sleep_reason"] = sleep_reason
+    state["progress"]["planned_wake_at"] = iso_after_seconds(sleep_seconds)
+    merge_execution_packet(
+        runtime_dir,
+        state,
+        {
+            "current_phase": worker_result.get("current_phase", {}),
+            "phase_plan": worker_result.get("phase_plan", []),
+            "next_action": worker_result.get("next_action", {}),
+        },
+        overwrite_missing_only=False,
+    )
     state["history"]["ticks_completed"] += 1
-    record_summary(runtime_dir, worker_result)
+    record_summary(runtime_dir, state, worker_result)
     append_event(runtime_dir, "tick_completed", {"model": used_model, "status": worker_result["status"]})
 
     if worker_result["lark_update_markdown"] and not args.disable_lark:
@@ -1169,6 +2047,7 @@ def init_runtime(args: argparse.Namespace) -> int:
         extract_doc_urls(mission_text),
         seeded_plan_steps(mission_text),
     )
+    state["lifecycle"]["status"] = "awaiting_plan_confirmation"
     if args.doc_url:
         urls = state["mission"]["doc_urls"]
         if args.doc_url not in urls:
@@ -1178,6 +2057,7 @@ def init_runtime(args: argparse.Namespace) -> int:
     write_text(runtime_dir / "prompts" / "worker_prompt.md", render_worker_prompt(runtime_dir, state))
     write_text(runtime_dir / "runbook.md", render_runbook(state))
     write_text(runtime_dir / "notes" / "latest_summary.md", "# Latest Summary\n\nRuntime initialized.\n")
+    merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=False)
     save_state(runtime_dir, state)
     append_event(runtime_dir, "runtime_initialized", {"mission_path": str(mission_path), "runtime_dir": str(runtime_dir)})
     print(str(runtime_dir))
@@ -1189,6 +2069,9 @@ def start_runtime(args: argparse.Namespace) -> int:
     ensure_runtime_layout(runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
+    state = load_state(runtime_dir)
+    if state["lifecycle"].get("status") == "awaiting_plan_confirmation":
+        raise SystemExit("Runtime is waiting for plan confirmation. Use mode-approve-plan or --auto-approve-plan flow before starting execution.")
     install_signal_handlers(runtime_dir)
 
     while True:
@@ -1201,10 +2084,22 @@ def start_runtime(args: argparse.Namespace) -> int:
         if state["lifecycle"]["status"] in {"completed", "failed", "blocked"}:
             return exit_code
 
-        sleep_seconds = max(30, int(state["progress"].get("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS)))
+        sleep_seconds = clamp_sleep_seconds(state["progress"].get("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS))
         state["supervisor"]["last_sleep_seconds"] = sleep_seconds
+        state["progress"]["next_sleep_seconds"] = sleep_seconds
+        state["progress"]["planned_wake_at"] = iso_after_seconds(sleep_seconds)
+        if not state["progress"].get("sleep_reason", "").strip():
+            state["progress"]["sleep_reason"] = "Use the default one-hour polling interval unless the worker provides a shorter estimate."
         save_state(runtime_dir, state)
-        append_event(runtime_dir, "supervisor_sleep", {"seconds": sleep_seconds})
+        append_event(
+            runtime_dir,
+            "supervisor_sleep",
+            {
+                "seconds": sleep_seconds,
+                "reason": state["progress"].get("sleep_reason", ""),
+                "planned_wake_at": state["progress"].get("planned_wake_at", ""),
+            },
+        )
         time.sleep(sleep_seconds)
 
 
@@ -1218,9 +2113,15 @@ def print_status(args: argparse.Namespace) -> int:
         "last_tick_at": state["supervisor"]["last_tick_at"],
         "active_model": state["supervisor"]["active_model"],
         "next_sleep_seconds": state["progress"]["next_sleep_seconds"],
+        "sleep_reason": state["progress"].get("sleep_reason", ""),
+        "planned_wake_at": state["progress"].get("planned_wake_at", ""),
         "summary": state["progress"]["summary"],
         "jobs": list(state["jobs"].keys()),
-        "plan": state.get("plan", {}).get("items", []),
+        "focused_job_ids": select_focused_job_ids(runtime_dir, state),
+        "plan": current_plan_items(state),
+        "plan_preview": preview_plan_items(state),
+        "planning": state.get("planning", {}),
+        "execution": state.get("execution", {}),
         "inputs": state.get("inputs", {}),
         "lark": state.get("lark", {}),
         "daemon": daemon_snapshot(runtime_dir),
@@ -1254,7 +2155,11 @@ def mode_status(args: argparse.Namespace) -> int:
     runtime_dir = resolve_runtime_dir(args.runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
-    print(render_mode_report(runtime_dir, flavor="status"))
+    state = load_state(runtime_dir)
+    if state["lifecycle"].get("status") == "awaiting_plan_confirmation":
+        print(render_plan_preview(runtime_dir))
+    else:
+        print(render_mode_report(runtime_dir, flavor="status"))
     return 0
 
 
@@ -1269,6 +2174,56 @@ def mode_start(args: argparse.Namespace) -> int:
             doc_url=args.doc_url,
         )
         init_runtime(init_args)
+
+    state = load_state(runtime_dir)
+    if args.auto_approve_plan:
+        approve_args = argparse.Namespace(
+            runtime_dir=str(runtime_dir),
+            daemon=args.daemon,
+            search=args.search,
+            disable_lark=args.disable_lark,
+            codex_config=args.codex_config,
+        )
+        return mode_approve_plan(approve_args)
+
+    if args.daemon:
+        append_event(runtime_dir, "daemon_start_deferred", {"reason": "awaiting_plan_confirmation"})
+
+    state["lifecycle"]["status"] = "awaiting_plan_confirmation"
+    state["progress"]["summary"] = "Plan preview generated. Waiting for user confirmation before execution."
+    state["progress"]["next_sleep_seconds"] = DEFAULT_INTERVAL_SECONDS
+    state["progress"]["sleep_reason"] = "Plan is awaiting confirmation; keep the default one-hour background polling interval if needed."
+    state["progress"]["planned_wake_at"] = iso_after_seconds(DEFAULT_INTERVAL_SECONDS)
+    merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=False)
+    save_state(runtime_dir, state)
+    print(render_plan_preview(runtime_dir))
+    return 0
+
+
+def mode_approve_plan(args: argparse.Namespace) -> int:
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
+    if not (runtime_dir / "state.json").exists():
+        raise SystemExit(f"Runtime not initialized: {runtime_dir}")
+    state = load_state(runtime_dir)
+    preview = state.get("planning", {}).get("preview", {})
+    items = deepcopy(preview.get("items", []))
+    if not items:
+        raise SystemExit("Plan preview is empty. Revise or regenerate the preview before approval.")
+
+    approved_at = now_iso()
+    set_current_plan_items(state, items)
+    preview["approved"] = True
+    preview["approved_at"] = approved_at
+    state["planning"]["current"]["version"] = max(int(preview.get("version", 1)), int(state["planning"]["current"].get("version", 0)))
+    state["planning"]["current"]["approved_at"] = approved_at
+    state["lifecycle"]["status"] = "running"
+    state["progress"]["summary"] = "Plan approved. Ready to execute."
+    state["progress"]["next_sleep_seconds"] = DEFAULT_INTERVAL_SECONDS
+    state["progress"]["sleep_reason"] = "Execution is ready; use the default one-hour polling interval until the worker returns a more specific estimate."
+    state["progress"]["planned_wake_at"] = iso_after_seconds(DEFAULT_INTERVAL_SECONDS)
+    merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=False)
+    append_event(runtime_dir, "plan_confirmed", {"version": preview.get("version", 1)})
+    save_state(runtime_dir, state)
 
     if args.daemon:
         daemon_args = argparse.Namespace(
@@ -1287,11 +2242,60 @@ def mode_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def mode_revise_plan(args: argparse.Namespace) -> int:
+    runtime_dir = resolve_runtime_dir(args.runtime_dir)
+    if not (runtime_dir / "state.json").exists():
+        raise SystemExit(f"Runtime not initialized: {runtime_dir}")
+
+    if args.file:
+        revision_note = read_text(Path(args.file).expanduser().resolve()).strip()
+    else:
+        revision_note = args.message.strip()
+    if not revision_note:
+        raise SystemExit("Revision message is empty")
+
+    forwarded = argparse.Namespace(
+        runtime_dir=str(runtime_dir),
+        message=revision_note,
+        file="",
+        source="chat",
+        title=args.title or "Plan revision request",
+        author=args.author,
+        json=False,
+        quiet=True,
+    )
+    add_input(forwarded)
+
+    state = load_state(runtime_dir)
+    base_items = preview_plan_items(state) or current_plan_items(state) or seeded_plan_steps(read_text(runtime_dir / "mission.md"))
+    revised_items = [{"step": f"Apply the latest user steering before execution: {revision_note}", "status": "in_progress"}]
+    for item in base_items:
+        step = str(item.get("step", "")).strip()
+        if not step:
+            continue
+        revised_items.append({"step": step, "status": "pending"})
+    set_preview_plan_items(state, revised_items, source="user_revision", revision_note=revision_note)
+    state["lifecycle"]["status"] = "awaiting_plan_confirmation"
+    state["progress"]["summary"] = "Plan preview revised. Waiting for user confirmation before execution."
+    state["progress"]["next_sleep_seconds"] = DEFAULT_INTERVAL_SECONDS
+    state["progress"]["sleep_reason"] = "The plan was revised; keep the default one-hour polling interval until the next confirmation."
+    state["progress"]["planned_wake_at"] = iso_after_seconds(DEFAULT_INTERVAL_SECONDS)
+    merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=False)
+    append_event(runtime_dir, "plan_revised", {"version": state["planning"]["preview"]["version"], "note": revision_note})
+    save_state(runtime_dir, state)
+    print(render_plan_preview(runtime_dir))
+    return 0
+
+
 def mode_sync(args: argparse.Namespace) -> int:
     runtime_dir = resolve_runtime_dir(args.runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
-    print(render_mode_report(runtime_dir, flavor="sync"))
+    state = load_state(runtime_dir)
+    if state["lifecycle"].get("status") == "awaiting_plan_confirmation":
+        print(render_plan_preview(runtime_dir))
+    else:
+        print(render_mode_report(runtime_dir, flavor="sync"))
     return 0
 
 
@@ -1315,8 +2319,12 @@ def mode_update(args: argparse.Namespace) -> int:
 def mode_plan(args: argparse.Namespace) -> int:
     runtime_dir = resolve_runtime_dir(args.runtime_dir)
     state = load_state(runtime_dir)
-    print("**Current Plan**\n")
-    print("\n".join(summarize_plan(state)))
+    if state["lifecycle"].get("status") == "awaiting_plan_confirmation":
+        print("**Plan Preview**\n")
+        print("\n".join(summarize_preview_plan(state)))
+    else:
+        print("**Current Plan**\n")
+        print("\n".join(summarize_plan(state)))
     return 0
 
 
@@ -1526,6 +2534,9 @@ def daemon_start(args: argparse.Namespace) -> int:
     ensure_runtime_layout(runtime_dir)
     if not (runtime_dir / "state.json").exists():
         raise SystemExit(f"Runtime not initialized: {runtime_dir}")
+    state = load_state(runtime_dir)
+    if state["lifecycle"].get("status") == "awaiting_plan_confirmation":
+        raise SystemExit("Runtime is waiting for plan confirmation. Approve the plan before starting the daemon.")
 
     snapshot = daemon_snapshot(runtime_dir)
     if snapshot["running"]:
@@ -1666,12 +2677,48 @@ def build_parser() -> argparse.ArgumentParser:
     mode_start_parser.add_argument("--search", action="store_true", help="Enable web search inside Codex when starting the daemon")
     mode_start_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates when starting the daemon")
     mode_start_parser.add_argument(
+        "--auto-approve-plan",
+        action="store_true",
+        help="Approve the generated preview plan immediately and continue into execution.",
+    )
+    mode_start_parser.add_argument(
         "--codex-config",
         action="append",
         default=[],
         help="Extra 'key=value' values passed through to codex exec via -c when starting the daemon",
     )
     mode_start_parser.set_defaults(func=mode_start)
+
+    mode_approve_parser = subparsers.add_parser("mode-approve-plan", help="Approve the current plan preview and enter execution mode.")
+    mode_approve_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
+    mode_approve_parser.add_argument("--daemon", action="store_true", help="Start the background supervisor after approval")
+    mode_approve_parser.add_argument("--search", action="store_true", help="Enable web search inside Codex when starting the daemon")
+    mode_approve_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates when starting the daemon")
+    mode_approve_parser.add_argument(
+        "--codex-config",
+        action="append",
+        default=[],
+        help="Extra 'key=value' values passed through to codex exec via -c when starting the daemon",
+    )
+    mode_approve_parser.set_defaults(func=mode_approve_plan)
+
+    mode_revise_parser = subparsers.add_parser("mode-revise-plan", help="Revise the current plan preview before execution starts.")
+    mode_revise_parser.add_argument(
+        "runtime_dir",
+        nargs="?",
+        default="",
+        help=f"Runtime directory created by init. Defaults to ./{DEFAULT_RUNTIME_DIRNAME} in the current working directory",
+    )
+    mode_revise_parser.add_argument("--message", default="", help="Revision note as a direct string")
+    mode_revise_parser.add_argument("--file", default="", help="Read the revision note from a file")
+    mode_revise_parser.add_argument("--title", default="Plan revision request", help="Optional short title")
+    mode_revise_parser.add_argument("--author", default="user", help="Author label")
+    mode_revise_parser.set_defaults(func=mode_revise_plan)
 
     mode_status_parser = subparsers.add_parser("mode-status", help="Render a conversation-style runtime status report.")
     mode_status_parser.add_argument(

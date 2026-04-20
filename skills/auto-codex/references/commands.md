@@ -10,7 +10,9 @@ python3 scripts/auto_codex.py <command> ...
 
 ```bash
 python3 scripts/auto_codex.py mode-start RUNTIME_DIR --mission /path/to/autoresearch.md
-python3 scripts/auto_codex.py mode-start RUNTIME_DIR --mission /path/to/autoresearch.md --daemon --search
+python3 scripts/auto_codex.py mode-approve-plan RUNTIME_DIR --daemon --search
+python3 scripts/auto_codex.py mode-start RUNTIME_DIR --mission /path/to/autoresearch.md --auto-approve-plan --daemon --search
+python3 scripts/auto_codex.py mode-revise-plan RUNTIME_DIR --message "Move literature review ahead of experiments."
 python3 scripts/auto_codex.py mode-status RUNTIME_DIR
 python3 scripts/auto_codex.py mode-sync RUNTIME_DIR
 python3 scripts/auto_codex.py mode-update RUNTIME_DIR --title "Change direction" --message "Please prioritize the job path first."

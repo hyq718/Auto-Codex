@@ -13,6 +13,7 @@ Prefer the wrapper script in this skill:
 
 ```bash
 python3 scripts/auto_codex.py mode-start --mission /path/to/autoresearch.md
+python3 scripts/auto_codex.py mode-approve-plan
 python3 scripts/auto_codex.py mode-status
 python3 scripts/auto_codex.py mode-update --message "New direction"
 ```
@@ -23,17 +24,20 @@ If `RUNTIME_DIR` is omitted, the runtime defaults to `./auto-codex` under the cu
 ## Workflow
 
 1. Bootstrap or enter mode with `mode-start`.
-2. Show the current report with `mode-status` or `mode-sync`.
-3. Convert user steering into persisted runtime input with `mode-update`.
-4. Use `mode-plan` and `mode-jobs` when the user asks for narrower views.
-5. Use `mode-pause`, `mode-resume`, or `mode-stop` to control runtime execution state.
-6. Fall back to lower-level runtime commands only when you need daemon, Slurm, or raw JSON inspection.
+2. Review the preview and use `mode-approve-plan` or `mode-revise-plan`.
+3. Show the current report with `mode-status` or `mode-sync`.
+4. Convert user steering into persisted runtime input with `mode-update`.
+5. Use `mode-plan` and `mode-jobs` when the user asks for narrower views.
+6. Use `mode-pause`, `mode-resume`, or `mode-stop` to control runtime execution state.
+7. Fall back to lower-level runtime commands only when you need daemon, Slurm, or raw JSON inspection.
 
 ## Command mapping
 
 Treat these as the conversation-mode equivalents of `/autoresearch` commands:
 
 - `/autoresearch start` -> `mode-start`
+- `/autoresearch approve-plan` -> `mode-approve-plan`
+- `/autoresearch revise-plan` -> `mode-revise-plan`
 - `/autoresearch status` -> `mode-status`
 - `/autoresearch sync` -> `mode-sync`
 - `/autoresearch update` -> `mode-update`
@@ -48,6 +52,7 @@ Read [references/commands.md](references/commands.md) only when you need the exa
 ## Guidance
 
 - Prefer `mode-*` commands when the user wants to stay oriented in the active Codex conversation.
+- Treat `mode-start` as a plan-preview entrypoint, not as immediate execution.
 - Treat `mode-update` as the bridge from chat into the runtime inbox.
 - Reuse the same runtime directory across turns; the persistent state is the real source of continuity.
 - Prefer the default `./auto-codex` runtime under the user's current project directory unless the user explicitly asks for another location.

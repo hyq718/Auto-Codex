@@ -7,9 +7,13 @@
     "status",
     "summary",
     "next_sleep_seconds",
+    "sleep_reason",
     "jobs_submitted",
     "artifacts_updated",
     "plan_updates",
+    "current_phase",
+    "phase_plan",
+    "next_action",
     "acknowledged_input_ids",
     "lark_update_markdown",
     "final_summary_markdown",
@@ -33,6 +37,9 @@
     "next_sleep_seconds": {
       "type": "integer",
       "minimum": 0
+    },
+    "sleep_reason": {
+      "type": "string"
     },
     "jobs_submitted": {
       "type": "array",
@@ -91,6 +98,92 @@
               "completed"
             ]
           }
+        }
+      }
+    },
+    "current_phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "goal",
+        "related_plan_step",
+        "related_job_ids",
+        "status"
+      ],
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "related_plan_step": {
+          "type": "string"
+        },
+        "related_job_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "phase_plan": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "summary",
+        "reason",
+        "primary_target",
+        "resume_targets",
+        "search_patterns",
+        "read_ladder",
+        "success_condition",
+        "fallback_if_missing"
+      ],
+      "properties": {
+        "summary": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "primary_target": {
+          "type": "string"
+        },
+        "resume_targets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "search_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "read_ladder": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "success_condition": {
+          "type": "string"
+        },
+        "fallback_if_missing": {
+          "type": "string"
         }
       }
     },

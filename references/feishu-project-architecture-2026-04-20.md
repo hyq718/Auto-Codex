@@ -144,6 +144,20 @@
 
 运行时的关键不是对话历史，而是 runtime 目录。
 
+这里需要特别强调一条当前已经落实到代码里的规则：
+
+- 如果用户没有显式指定 `runtime_dir`
+- 那么 Auto-Codex 默认会把 runtime 创建在“当前工作目录”下的 `./auto-codex`
+
+也就是说：
+
+- 如果用户在 `/path/to/LLaMA-Factory` 中启动 autoresearch
+- 默认 runtime 会落在 `/path/to/LLaMA-Factory/auto-codex`
+
+而不是落在 `Auto-Codex` 仓库目录下。
+
+这条规则的目的是让 runtime 跟随“被研究的项目”而不是“工具仓库本身”。
+
 当前 runtime layout 主要包含：
 
 - `mission.md`
