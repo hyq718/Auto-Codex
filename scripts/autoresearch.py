@@ -30,6 +30,7 @@ DEFAULT_LARK_POLL_INTERVAL_SECONDS = 7200
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 7200
 MAX_INPUT_EXCERPT_CHARS = 6000
 SYSTEM_SECTION_PREFIX = "Autoresearch System:"
+MODE_RECENT_EVENT_LIMIT = 8
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM}
 GLOBAL_STOP_REQUESTED = False
 
@@ -187,6 +188,7 @@ def default_state(
             "last_tick_at": "",
             "last_sleep_seconds": 0,
             "consecutive_failures": 0,
+            "paused": False,
         },
         "progress": {
             "summary": "Runtime initialized.",
@@ -294,6 +296,7 @@ def ensure_state_defaults(state: dict[str, Any]) -> dict[str, Any]:
     state["supervisor"].setdefault("last_tick_at", "")
     state["supervisor"].setdefault("last_sleep_seconds", 0)
     state["supervisor"].setdefault("consecutive_failures", 0)
+    state["supervisor"].setdefault("paused", False)
 
     state["progress"].setdefault("summary", "")
     state["progress"].setdefault("last_worker_status", "")
@@ -389,6 +392,20 @@ def write_pending_inputs_markdown(runtime_dir: Path, items: list[dict[str, Any]]
     return path
 
 
+def load_events(runtime_dir: Path) -> list[dict[str, Any]]:
+    path = runtime_dir / "events.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            events.append(json.loads(line))
+    return events
+
+
 def refresh_input_counters(state: dict[str, Any], items: list[dict[str, Any]]) -> None:
     pending = [item for item in items if item.get("status") == "pending"]
     acknowledged = [item for item in items if item.get("status") == "acknowledged"]
@@ -398,6 +415,114 @@ def refresh_input_counters(state: dict[str, Any], items: list[dict[str, Any]]) -
         "last_added_at": items[-1]["created_at"] if items else "",
         "last_acknowledged_at": acknowledged[-1]["acknowledged_at"] if acknowledged else "",
     }
+
+
+def summarize_jobs(state: dict[str, Any], limit: int = 10) -> list[str]:
+    lines: list[str] = []
+    for job_id, metadata in list(state.get("jobs", {}).items())[:limit]:
+        status = metadata.get("status", "unknown")
+        script = Path(metadata.get("script", "")).name if metadata.get("script") else ""
+        suffix = f" | {script}" if script else ""
+        lines.append(f"- `{job_id}`: {status}{suffix}")
+    return lines or ["- none"]
+
+
+def summarize_plan(state: dict[str, Any], limit: int = 8) -> list[str]:
+    lines = [f"- [{item.get('status', 'pending')}] {item.get('step', '')}" for item in state.get("plan", {}).get("items", [])[:limit]]
+    return lines or ["- none"]
+
+
+def summarize_pending_inputs(runtime_dir: Path, limit: int = 8) -> list[str]:
+    pending = [item for item in load_inputs(runtime_dir) if item.get("status") == "pending"]
+    lines = []
+    for item in pending[:limit]:
+        title = f" | {item['title']}" if item.get("title") else ""
+        lines.append(f"- `{item['id']}` [{item.get('source', '')}] {truncate_text(item.get('content', ''), 180)}{title}")
+    return lines or ["- none"]
+
+
+def summarize_recent_events(runtime_dir: Path, limit: int = MODE_RECENT_EVENT_LIMIT) -> list[str]:
+    interesting = []
+    for event in load_events(runtime_dir):
+        event_type = event.get("type", "")
+        if event_type in {
+            "tick_completed",
+            "tick_failed",
+            "input_added",
+            "inputs_acknowledged_by_worker",
+            "lark_heartbeat_sent",
+            "lark_poll_changed",
+            "job_submitted",
+            "daemon_started",
+            "daemon_stop_requested",
+            "model_switched",
+        }:
+            interesting.append(event)
+    lines = []
+    for event in interesting[-limit:]:
+        lines.append(f"- {event.get('ts', '')}: {event.get('type', '')}")
+    return lines or ["- none"]
+
+
+def infer_next_action(state: dict[str, Any], runtime_dir: Path) -> str:
+    if state["supervisor"].get("paused"):
+        return "Wait for `/autoresearch resume` before doing more work."
+    pending = [item for item in load_inputs(runtime_dir) if item.get("status") == "pending"]
+    if pending:
+        newest = pending[0]
+        return f"Consume pending input `{newest['id']}` and decide whether it changes the plan."
+    lifecycle = state["lifecycle"].get("status", "")
+    if lifecycle == "waiting_job":
+        return "Poll job state and logs, then resume execution when results are ready."
+    if lifecycle == "blocked":
+        return "Resolve the current blocker or ask the user for a decision."
+    if state.get("jobs"):
+        return "Refresh active jobs and continue the highest-priority executable task."
+    return "Run the next highest-priority task from the current plan."
+
+
+def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
+    state = load_state(runtime_dir)
+    goal = state["mission"].get("title", Path(runtime_dir).name)
+    waiting_reason = state["lifecycle"].get("stop_reason", "").strip()
+    lifecycle = "paused" if state["supervisor"].get("paused") else state["lifecycle"].get("status", "")
+
+    if lifecycle in {"waiting_job", "blocked"} and not waiting_reason:
+        waiting_reason = state["progress"].get("summary", "").strip()
+    if not waiting_reason:
+        waiting_reason = "none"
+
+    header = "**Auto-Codex Sync**" if flavor == "sync" else "**Auto-Codex Status**"
+    sections = [
+        header,
+        "",
+        f"**Goal**",
+        goal,
+        "",
+        f"**Current Plan**",
+        "\n".join(summarize_plan(state)),
+        "",
+        f"**Latest Progress**",
+        state["progress"].get("summary", "").strip() or "No progress recorded yet.",
+        "",
+        f"**Waiting / Blockers**",
+        f"- lifecycle: {lifecycle}",
+        f"- reason: {waiting_reason}",
+        f"- pending inputs: {state.get('inputs', {}).get('pending', 0)}",
+        "",
+        f"**Active Jobs**",
+        "\n".join(summarize_jobs(state)),
+        "",
+        f"**Pending Inputs**",
+        "\n".join(summarize_pending_inputs(runtime_dir)),
+        "",
+        f"**Recent Runtime Events**",
+        "\n".join(summarize_recent_events(runtime_dir)),
+        "",
+        f"**Next Action**",
+        infer_next_action(state, runtime_dir),
+    ]
+    return "\n".join(sections).strip() + "\n"
 
 
 def make_input_item(source: str, content: str, title: str = "", author: str = "user") -> dict[str, Any]:
@@ -915,6 +1040,11 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     if state["lifecycle"].get("stop_requested"):
         append_event(runtime_dir, "tick_skipped", {"reason": "stop_requested"})
         return 0
+    if state["supervisor"].get("paused"):
+        append_event(runtime_dir, "tick_skipped", {"reason": "paused"})
+        state["lifecycle"]["status"] = "paused"
+        save_state(runtime_dir, state)
+        return 0
 
     state["supervisor"]["last_tick_at"] = now_iso()
     maybe_poll_lark_inputs(runtime_dir, state, args.disable_lark)
@@ -1100,6 +1230,7 @@ def stop_runtime(args: argparse.Namespace) -> int:
     state = load_state(runtime_dir)
     state["lifecycle"]["stop_requested"] = True
     state["lifecycle"]["stop_reason"] = args.reason
+    state["lifecycle"]["status"] = "stopped"
     save_state(runtime_dir, state)
     append_event(runtime_dir, "stop_requested", {"reason": args.reason})
     if not args.disable_lark:
@@ -1108,6 +1239,122 @@ def stop_runtime(args: argparse.Namespace) -> int:
             state,
             f"## {SYSTEM_SECTION_PREFIX} Stopped\n\n- Time: {now_iso()}\n- Reason: {args.reason}\n",
         )
+    return 0
+
+
+def mode_status(args: argparse.Namespace) -> int:
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    if not (runtime_dir / "state.json").exists():
+        raise SystemExit(f"Runtime not initialized: {runtime_dir}")
+    print(render_mode_report(runtime_dir, flavor="status"))
+    return 0
+
+
+def mode_start(args: argparse.Namespace) -> int:
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    if not (runtime_dir / "state.json").exists():
+        if not args.mission:
+            raise SystemExit(f"Runtime not initialized: {runtime_dir}. Provide --mission to bootstrap it.")
+        init_args = argparse.Namespace(
+            mission=args.mission,
+            runtime_dir=str(runtime_dir),
+            doc_url=args.doc_url,
+        )
+        init_runtime(init_args)
+
+    if args.daemon:
+        daemon_args = argparse.Namespace(
+            runtime_dir=str(runtime_dir),
+            search=args.search,
+            disable_lark=args.disable_lark,
+            codex_config=args.codex_config,
+        )
+        try:
+            daemon_start(daemon_args)
+        except SystemExit as exc:
+            if "Supervisor already running" not in str(exc):
+                raise
+
+    print(render_mode_report(runtime_dir, flavor="status"))
+    return 0
+
+
+def mode_sync(args: argparse.Namespace) -> int:
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    if not (runtime_dir / "state.json").exists():
+        raise SystemExit(f"Runtime not initialized: {runtime_dir}")
+    print(render_mode_report(runtime_dir, flavor="sync"))
+    return 0
+
+
+def mode_update(args: argparse.Namespace) -> int:
+    forwarded = argparse.Namespace(
+        runtime_dir=args.runtime_dir,
+        message=args.message,
+        file=args.file,
+        source="chat",
+        title=args.title,
+        author=args.author,
+        json=False,
+        quiet=True,
+    )
+    add_input(forwarded)
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    print(render_mode_report(runtime_dir, flavor="sync"))
+    return 0
+
+
+def mode_plan(args: argparse.Namespace) -> int:
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    state = load_state(runtime_dir)
+    print("**Current Plan**\n")
+    print("\n".join(summarize_plan(state)))
+    return 0
+
+
+def mode_jobs(args: argparse.Namespace) -> int:
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    state = load_state(runtime_dir)
+    print("**Active Jobs**\n")
+    print("\n".join(summarize_jobs(state)))
+    return 0
+
+
+def mode_pause(args: argparse.Namespace) -> int:
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    state = load_state(runtime_dir)
+    state["supervisor"]["paused"] = True
+    state["lifecycle"]["status"] = "paused"
+    append_event(runtime_dir, "mode_paused", {})
+    save_state(runtime_dir, state)
+    print(render_mode_report(runtime_dir, flavor="status"))
+    return 0
+
+
+def mode_resume(args: argparse.Namespace) -> int:
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    state = load_state(runtime_dir)
+    state["supervisor"]["paused"] = False
+    if state["lifecycle"].get("status") == "paused":
+        state["lifecycle"]["status"] = "running"
+    append_event(runtime_dir, "mode_resumed", {})
+    save_state(runtime_dir, state)
+    print(render_mode_report(runtime_dir, flavor="status"))
+    return 0
+
+
+def mode_stop(args: argparse.Namespace) -> int:
+    runtime_dir = Path(args.runtime_dir).expanduser().resolve()
+    stop_args = argparse.Namespace(
+        runtime_dir=str(runtime_dir),
+        reason=args.reason,
+        disable_lark=args.disable_lark,
+    )
+    if args.daemon:
+        daemon_stop(stop_args)
+    else:
+        stop_runtime(stop_args)
+    print(render_mode_report(runtime_dir, flavor="status"))
     return 0
 
 
@@ -1208,7 +1455,7 @@ def add_input(args: argparse.Namespace) -> int:
 
     if args.json:
         print(json.dumps(item, indent=2, ensure_ascii=False))
-    else:
+    elif not getattr(args, "quiet", False):
         print(f"added input {item['id']}")
     return 0
 
@@ -1322,6 +1569,7 @@ def daemon_stop(args: argparse.Namespace) -> int:
     state = load_state(runtime_dir)
     state["lifecycle"]["stop_requested"] = True
     state["lifecycle"]["stop_reason"] = args.reason
+    state["lifecycle"]["status"] = "stopped"
     save_state(runtime_dir, state)
     append_event(runtime_dir, "daemon_stop_requested", {"pid": pid, "reason": args.reason})
     os.kill(pid, signal.SIGTERM)
@@ -1377,6 +1625,60 @@ def build_parser() -> argparse.ArgumentParser:
     stop_parser.add_argument("--reason", default="manual stop", help="Reason to record in state and Lark")
     stop_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates")
     stop_parser.set_defaults(func=stop_runtime)
+
+    mode_start_parser = subparsers.add_parser("mode-start", help="Enter Auto-Codex conversation mode for a runtime.")
+    mode_start_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_start_parser.add_argument("--mission", default="", help="Mission markdown used to bootstrap the runtime if needed")
+    mode_start_parser.add_argument("--doc-url", default="", help="Optional Lark/Feishu doc URL to append updates to")
+    mode_start_parser.add_argument("--daemon", action="store_true", help="Start the background supervisor if it is not running")
+    mode_start_parser.add_argument("--search", action="store_true", help="Enable web search inside Codex when starting the daemon")
+    mode_start_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates when starting the daemon")
+    mode_start_parser.add_argument(
+        "--codex-config",
+        action="append",
+        default=[],
+        help="Extra 'key=value' values passed through to codex exec via -c when starting the daemon",
+    )
+    mode_start_parser.set_defaults(func=mode_start)
+
+    mode_status_parser = subparsers.add_parser("mode-status", help="Render a conversation-style runtime status report.")
+    mode_status_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_status_parser.set_defaults(func=mode_status)
+
+    mode_sync_parser = subparsers.add_parser("mode-sync", help="Render a sync report with recent runtime events and pending inputs.")
+    mode_sync_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_sync_parser.set_defaults(func=mode_sync)
+
+    mode_update_parser = subparsers.add_parser("mode-update", help="Add a chat-style input and render the updated sync report.")
+    mode_update_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_update_parser.add_argument("--message", default="", help="Input content as a direct string")
+    mode_update_parser.add_argument("--file", default="", help="Read input content from a file")
+    mode_update_parser.add_argument("--title", default="", help="Optional short title")
+    mode_update_parser.add_argument("--author", default="user", help="Author label")
+    mode_update_parser.set_defaults(func=mode_update)
+
+    mode_plan_parser = subparsers.add_parser("mode-plan", help="Render the current plan in a conversation-friendly format.")
+    mode_plan_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_plan_parser.set_defaults(func=mode_plan)
+
+    mode_jobs_parser = subparsers.add_parser("mode-jobs", help="Render active jobs in a conversation-friendly format.")
+    mode_jobs_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_jobs_parser.set_defaults(func=mode_jobs)
+
+    mode_pause_parser = subparsers.add_parser("mode-pause", help="Pause the runtime and render the new status.")
+    mode_pause_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_pause_parser.set_defaults(func=mode_pause)
+
+    mode_resume_parser = subparsers.add_parser("mode-resume", help="Resume a paused runtime and render the new status.")
+    mode_resume_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_resume_parser.set_defaults(func=mode_resume)
+
+    mode_stop_parser = subparsers.add_parser("mode-stop", help="Stop the runtime and render the final status report.")
+    mode_stop_parser.add_argument("runtime_dir", help="Runtime directory created by init")
+    mode_stop_parser.add_argument("--reason", default="manual stop", help="Reason to record in state and Lark")
+    mode_stop_parser.add_argument("--disable-lark", action="store_true", help="Skip Lark document updates")
+    mode_stop_parser.add_argument("--daemon", action="store_true", help="Also stop the background supervisor if it is running")
+    mode_stop_parser.set_defaults(func=mode_stop)
 
     add_input_parser = subparsers.add_parser("add-input", help="Add a persisted user input to the runtime inbox.")
     add_input_parser.add_argument("runtime_dir", help="Runtime directory created by init")

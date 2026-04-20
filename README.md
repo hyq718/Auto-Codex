@@ -2,6 +2,8 @@
 
 `Auto-Codex` turns a single `autoresearch.md` mission file into a persistent Codex runtime.
 
+It now also exposes a conversation-mode adapter so the runtime can be surfaced as a `/autoresearch`-style control loop instead of only as low-level supervisor commands.
+
 The design goal is simple:
 
 - user input: one mission markdown
@@ -24,6 +26,7 @@ Repository:
 ## What is here
 
 - [`scripts/autoresearch.py`](./scripts/autoresearch.py): init, start, status, and stop commands
+- conversation-mode commands: `mode-start`, `mode-status`, `mode-sync`, `mode-update`, `mode-plan`, `mode-jobs`, `mode-pause`, `mode-resume`, `mode-stop`
 - background supervisor support: `daemon-start`, `daemon-stop`, `daemon-status`
 - persisted input support: `add-input`, `list-inputs`, `ack-input`
 - Feishu polling and heartbeat support built into the supervisor
@@ -75,6 +78,16 @@ Check progress:
 
 ```bash
 python3 scripts/autoresearch.py status /path/to/runtime --json
+```
+
+Conversation-style entry:
+
+```bash
+python3 scripts/autoresearch.py mode-start /path/to/runtime --mission /path/to/autoresearch.md
+python3 scripts/autoresearch.py mode-status /path/to/runtime
+python3 scripts/autoresearch.py mode-update /path/to/runtime \
+  --title "New direction" \
+  --message "Please prioritize the job-monitoring path first."
 ```
 
 Run in the background:
@@ -145,6 +158,106 @@ python3 scripts/autoresearch.py init /home/yqhao/autoresearch.md \
 ```
 
 ## Commands
+
+### Conversation mode
+
+The new mode adapter is meant to mirror an in-chat `/autoresearch` experience on top of the existing runtime.
+
+Recommended mapping:
+
+- `/autoresearch start` -> `mode-start`
+- `/autoresearch status` -> `mode-status`
+- `/autoresearch sync` -> `mode-sync`
+- `/autoresearch update` -> `mode-update`
+- `/autoresearch plan` -> `mode-plan`
+- `/autoresearch jobs` -> `mode-jobs`
+- `/autoresearch pause` -> `mode-pause`
+- `/autoresearch resume` -> `mode-resume`
+- `/autoresearch stop` -> `mode-stop`
+
+`mode-*` commands do not replace the runtime. They render and manipulate the same persisted state that the supervisor uses.
+
+### `mode-start`
+
+Enter Auto-Codex mode for a runtime. If the runtime does not exist yet, `mode-start` can bootstrap it from one mission markdown.
+
+```bash
+python3 scripts/autoresearch.py mode-start RUNTIME_DIR --mission /path/to/autoresearch.md
+```
+
+Useful flags:
+
+- `--mission`: bootstrap the runtime if it does not exist yet
+- `--doc-url`: attach a Lark/Feishu doc target during bootstrap
+- `--daemon`: also start the background supervisor
+- `--search`: enable web search when `--daemon` starts the supervisor
+- `--codex-config key=value`: pass extra `-c key=value` to `codex exec` when `--daemon` is used
+
+### `mode-status`
+
+Render the current runtime as a conversation-style status report.
+
+```bash
+python3 scripts/autoresearch.py mode-status RUNTIME_DIR
+```
+
+### `mode-sync`
+
+Render a sync report with recent progress, inputs, and runtime events.
+
+```bash
+python3 scripts/autoresearch.py mode-sync RUNTIME_DIR
+```
+
+### `mode-update`
+
+Persist a chat-style input and immediately re-render the sync report.
+
+```bash
+python3 scripts/autoresearch.py mode-update RUNTIME_DIR \
+  --title "Change direction" \
+  --message "Please prioritize the job-monitoring path first."
+```
+
+### `mode-plan`
+
+Render the current plan in a conversation-friendly format.
+
+```bash
+python3 scripts/autoresearch.py mode-plan RUNTIME_DIR
+```
+
+### `mode-jobs`
+
+Render active jobs in a conversation-friendly format.
+
+```bash
+python3 scripts/autoresearch.py mode-jobs RUNTIME_DIR
+```
+
+### `mode-pause`
+
+Pause the runtime and surface the updated status.
+
+```bash
+python3 scripts/autoresearch.py mode-pause RUNTIME_DIR
+```
+
+### `mode-resume`
+
+Resume a paused runtime and surface the updated status.
+
+```bash
+python3 scripts/autoresearch.py mode-resume RUNTIME_DIR
+```
+
+### `mode-stop`
+
+Stop the runtime and surface the final status. Add `--daemon` to also stop the background supervisor process.
+
+```bash
+python3 scripts/autoresearch.py mode-stop RUNTIME_DIR --reason "manual stop"
+```
 
 ### `init`
 
@@ -349,6 +462,35 @@ Inputs can come from two places:
 - local runtime commands such as `add-input`
 - Feishu document polling when the runtime has a doc URL
 
+The conversation mode uses the same input layer:
+
+- `mode-update` writes `source=chat` input records
+- supervisor ticks inject pending inputs into the worker prompt
+- the worker can acknowledge them through `acknowledged_input_ids`
+
+## Conversation mode architecture
+
+The current implementation is intentionally split into two layers:
+
+- `runtime`: persistent state, worker bursts, job tracking, Lark sync, recovery
+- `mode adapter`: conversation-style commands that render runtime state into a stable chat-friendly structure
+
+The mode report currently surfaces:
+
+- goal
+- current plan
+- latest progress
+- waiting or blocker state
+- active jobs
+- pending inputs
+- recent runtime events
+- next action
+
+That means the repo now supports both:
+
+- unattended execution through `start` or `daemon-start`
+- user-visible control through `mode-*` commands
+
 ## Plan support
 
 The runtime has a built-in plan layer.
@@ -422,6 +564,7 @@ Current limitations include:
 - no plugin packaging yet; this is currently a `skill + scripts` project
 - no deep scheduler semantics yet beyond `sbatch` registration plus `squeue` refresh
 - Feishu input detection uses document diffing rather than richer structured signals
+- the `/autoresearch` experience is currently exposed as CLI `mode-*` commands, not as a native Codex slash command or plugin UI yet
 
 ## Development
 
