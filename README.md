@@ -71,6 +71,13 @@ The current implementation assumes:
 
 ## Quick start
 
+One-command local install after `git clone`:
+
+```bash
+cd Auto-Codex
+./install.sh
+```
+
 ```bash
 python3 scripts/autoresearch.py init /path/to/autoresearch.md --runtime-dir /path/to/runtime
 python3 scripts/autoresearch.py start /path/to/runtime --search
@@ -95,6 +102,28 @@ python3 scripts/autoresearch.py mode-update /path/to/runtime \
 ## Install as a Codex skill
 
 The repository now ships with a dedicated skill package at [`skills/auto-codex`](./skills/auto-codex).
+
+Recommended installer:
+
+```bash
+./install.sh
+```
+
+What it does by default:
+
+- installs `auto-codex` into `~/.agents/skills/auto-codex`
+- installs `auto-codex` into `~/.codex/skills/auto-codex`
+- installs a local plugin into `~/plugins/auto-codex`
+- updates `~/.agents/plugins/marketplace.json`
+
+Useful flags:
+
+```bash
+./install.sh --copy
+./install.sh --no-plugin
+./install.sh --no-codex-skill
+./install.sh --no-agents-skill
+```
 
 Install it into the local Codex skill directory:
 
