@@ -26,6 +26,7 @@ Repository:
 ## What is here
 
 - [`scripts/autoresearch.py`](./scripts/autoresearch.py): init, start, status, and stop commands
+- installable Codex skill: [`skills/auto-codex`](./skills/auto-codex)
 - conversation-mode commands: `mode-start`, `mode-status`, `mode-sync`, `mode-update`, `mode-plan`, `mode-jobs`, `mode-pause`, `mode-resume`, `mode-stop`
 - background supervisor support: `daemon-start`, `daemon-stop`, `daemon-status`
 - persisted input support: `add-input`, `list-inputs`, `ack-input`
@@ -89,6 +90,29 @@ python3 scripts/autoresearch.py mode-update /path/to/runtime \
   --title "New direction" \
   --message "Please prioritize the job-monitoring path first."
 ```
+
+## Install as a Codex skill
+
+The repository now ships with a dedicated skill package at [`skills/auto-codex`](./skills/auto-codex).
+
+Install it into the local Codex skill directory:
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+ln -sfn /home/yqhao/autoresearch_for_codex/skills/auto-codex \
+  "${CODEX_HOME:-$HOME/.codex}/skills/auto-codex"
+```
+
+After that, new Codex sessions can discover `auto-codex` as a first-class skill.
+
+The skill ships with a wrapper launcher:
+
+```bash
+python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py repo-root
+python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.py mode-status /path/to/runtime
+```
+
+If the repo is installed somewhere else, set `AUTO_CODEX_REPO=/path/to/Auto-Codex` so the wrapper can locate the runtime entrypoint.
 
 Run in the background:
 

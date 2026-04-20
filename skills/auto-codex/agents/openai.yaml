@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auto-Codex"
+  short_description: "Persistent autoresearch runtime control."
+  default_prompt: "Use $auto-codex to bootstrap, inspect, or steer a persistent autoresearch runtime from one mission markdown."
