@@ -1,0 +1,20 @@
+{
+  "name": "auto-codex-local",
+  "interface": {
+    "displayName": "Auto-Codex Local"
+  },
+  "plugins": [
+    {
+      "name": "auto-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/auto-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

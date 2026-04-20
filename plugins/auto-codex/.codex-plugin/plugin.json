@@ -1,0 +1,39 @@
+{
+  "name": "auto-codex",
+  "version": "0.1.0",
+  "description": "Conversation-mode wrapper around the Auto-Codex persistent autoresearch runtime.",
+  "author": {
+    "name": "YQ Hao",
+    "url": "https://github.com/hyq718"
+  },
+  "homepage": "https://github.com/hyq718/Auto-Codex",
+  "repository": "https://github.com/hyq718/Auto-Codex",
+  "license": "UNLICENSED",
+  "keywords": [
+    "codex",
+    "autoresearch",
+    "agent",
+    "feishu",
+    "slurm"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Auto-Codex",
+    "shortDescription": "Persistent autoresearch mode for Codex.",
+    "longDescription": "Bootstrap, inspect, and steer a persistent autoresearch runtime from a single mission markdown, with on-disk state, job tracking, and Feishu reporting.",
+    "developerName": "YQ Hao",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write",
+      "Background Tasks"
+    ],
+    "websiteURL": "https://github.com/hyq718/Auto-Codex",
+    "defaultPrompt": [
+      "Start Auto-Codex from my autoresearch.md mission.",
+      "Show the current Auto-Codex plan and latest progress.",
+      "Send a new direction into the active Auto-Codex runtime."
+    ],
+    "brandColor": "#1C6B4A"
+  }
+}

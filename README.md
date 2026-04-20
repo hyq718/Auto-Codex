@@ -27,6 +27,7 @@ Repository:
 
 - [`scripts/autoresearch.py`](./scripts/autoresearch.py): init, start, status, and stop commands
 - installable Codex skill: [`skills/auto-codex`](./skills/auto-codex)
+- repo-local plugin: [`plugins/auto-codex`](./plugins/auto-codex/.codex-plugin/plugin.json)
 - conversation-mode commands: `mode-start`, `mode-status`, `mode-sync`, `mode-update`, `mode-plan`, `mode-jobs`, `mode-pause`, `mode-resume`, `mode-stop`
 - background supervisor support: `daemon-start`, `daemon-stop`, `daemon-status`
 - persisted input support: `add-input`, `list-inputs`, `ack-input`
@@ -113,6 +114,22 @@ python3 /home/yqhao/autoresearch_for_codex/skills/auto-codex/scripts/auto_codex.
 ```
 
 If the repo is installed somewhere else, set `AUTO_CODEX_REPO=/path/to/Auto-Codex` so the wrapper can locate the runtime entrypoint.
+
+## Install as a local plugin
+
+The repository also ships with a repo-local plugin scaffold at [`plugins/auto-codex`](./plugins/auto-codex/.codex-plugin/plugin.json).
+
+Repo-local marketplace files:
+
+- [`plugins/auto-codex/.codex-plugin/plugin.json`](./plugins/auto-codex/.codex-plugin/plugin.json)
+- [`/.agents/plugins/marketplace.json`](./.agents/plugins/marketplace.json)
+
+For this machine I also wired a home-local marketplace entry:
+
+- `~/plugins/auto-codex` -> symlink to the repo plugin
+- `~/.agents/plugins/marketplace.json`
+
+If your Codex frontend supports local plugin discovery, fully restart the app after these files exist so it can rescan the marketplace.
 
 Run in the background:
 
