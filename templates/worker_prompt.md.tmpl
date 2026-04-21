@@ -35,7 +35,7 @@ Rules:
 - Only return `status="waiting_job"` when at least one currently queued or running job is expected to produce the next useful signal and no higher-value local remediation is immediately available.
 - If no external wait is blocking progress, keep `status="working"` and return `next_sleep_seconds=0` so the supervisor immediately launches the next burst.
 - Reserve delayed sleep for real external waits, explicit retry/backoff, or a waiting job.
-- The sleep strategy is dual-mode: fall back to waking within 1 hour when uncertain, but prefer a shorter estimate when logs expose enough progress information to predict the next useful checkpoint.
+- The sleep strategy is dual-mode: use short retry/backoff intervals around 5 minutes for internal failures or uncertain recovery loops, and reserve one-hour polling for real `waiting_job` states or log-derived estimates that still need a long poll.
 - For example, if logs show throughput such as `5s/it` and you are waiting for `10k eval`, estimate when that checkpoint should appear, wake then, and cap the sleep to 1 hour before re-checking.
 - If you are blocked on a missing permission, resource, or human decision, return `status="blocked"`.
 - If the mission is complete, return `status="done"`.

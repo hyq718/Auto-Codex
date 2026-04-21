@@ -26,6 +26,7 @@ SCHEMA_PATH = PROJECT_ROOT / "schemas" / "agent_response.schema.json"
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_FALLBACK_MODEL = "gpt-5.3-codex-spark"
 DEFAULT_INTERVAL_SECONDS = 3600
+DEFAULT_FAILURE_RETRY_SECONDS = 300
 DEFAULT_LARK_POLL_INTERVAL_SECONDS = 7200
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 7200
 DEFAULT_WORKER_SANDBOX = "workspace-write"
@@ -1146,7 +1147,8 @@ def estimate_sleep_from_logs(runtime_dir: Path, state: dict[str, Any]) -> tuple[
 
 def choose_sleep_policy(runtime_dir: Path, state: dict[str, Any], worker_result: dict[str, Any]) -> tuple[int, str]:
     worker_status = worker_result.get("status", "")
-    worker_sleep = clamp_sleep_seconds(worker_result.get("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS))
+    default_sleep = DEFAULT_INTERVAL_SECONDS if worker_status == "waiting_job" else DEFAULT_FAILURE_RETRY_SECONDS
+    worker_sleep = clamp_sleep_seconds(worker_result.get("next_sleep_seconds", default_sleep))
     worker_reason = str(worker_result.get("sleep_reason", "")).strip()
 
     if worker_status == "working":
@@ -1156,7 +1158,10 @@ def choose_sleep_policy(runtime_dir: Path, state: dict[str, Any], worker_result:
 
     if worker_status != "waiting_job":
         if not worker_reason:
-            worker_reason = "Use the worker-provided cadence, capped at the one-hour maximum."
+            worker_reason = (
+                "Use the worker-provided cadence. If this is an internal retry or uncertain recovery path, "
+                "prefer the default five-minute retry window instead of a one-hour wait."
+            )
         return worker_sleep, worker_reason
 
     helper_estimate = estimate_sleep_from_logs(runtime_dir, state)
@@ -2883,9 +2888,11 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
             "session_log_path": "",
         }
         state["progress"]["summary"] = "Codex tick failed."
-        state["progress"]["next_sleep_seconds"] = DEFAULT_INTERVAL_SECONDS
-        state["progress"]["sleep_reason"] = "Worker tick failed; fall back to the default one-hour polling interval."
-        state["progress"]["planned_wake_at"] = iso_after_seconds(DEFAULT_INTERVAL_SECONDS)
+        state["progress"]["next_sleep_seconds"] = DEFAULT_FAILURE_RETRY_SECONDS
+        state["progress"]["sleep_reason"] = (
+            "Worker tick failed or timed out; retry in five minutes. Reserve one-hour polling for real waiting-job loops."
+        )
+        state["progress"]["planned_wake_at"] = iso_after_seconds(DEFAULT_FAILURE_RETRY_SECONDS)
         merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=False)
         append_event(runtime_dir, "tick_failed", {"model": used_model, "output": last_output[-4000:]})
         save_state(runtime_dir, state)
