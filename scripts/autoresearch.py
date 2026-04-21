@@ -30,6 +30,7 @@ DEFAULT_LARK_POLL_INTERVAL_SECONDS = 7200
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 7200
 DEFAULT_WORKER_SANDBOX = "workspace-write"
 DEFAULT_WORKER_APPROVAL_POLICY = "on-request"
+DEFAULT_WORKER_TICK_TIMEOUT_SECONDS = 1200
 MIN_SLEEP_SECONDS = 30
 MAX_SLEEP_SECONDS = 3600
 MAX_INPUT_EXCERPT_CHARS = 6000
@@ -1333,9 +1334,19 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
     phase_plan = execution.get("phase_plan", [])
 
     header = "**Auto-Codex Sync**" if flavor == "sync" else "**Auto-Codex Status**"
+    wait_banner: list[str] = []
+    if lifecycle == "waiting_job":
+        wait_banner = [
+            "**(Entering wait)**",
+            f"- Auto-Codex is waiting for the next scheduled wake-up, not exiting.",
+            f"- planned wake at: {state.get('progress', {}).get('planned_wake_at', '') or 'none'}",
+            f"- sleep reason: {state.get('progress', {}).get('sleep_reason', '') or 'none'}",
+            "",
+        ]
     sections = [
         header,
         "",
+        *wait_banner,
         f"**Goal**",
         goal,
         "",
@@ -1423,19 +1434,28 @@ def capture_command(
     cwd: Path | None = None,
     stdin_text: str | None = None,
     env: dict[str, str] | None = None,
+    timeout_seconds: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command_env = os.environ.copy()
     if env:
         command_env.update(env)
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        input=stdin_text,
-        text=True,
-        capture_output=True,
-        env=command_env,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            input=stdin_text,
+            text=True,
+            capture_output=True,
+            env=command_env,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        timeout_note = f"Command timed out after {timeout_seconds} seconds."
+        stderr = f"{stderr}\n{timeout_note}".strip()
+        return subprocess.CompletedProcess(cmd, 124, stdout=stdout, stderr=stderr)
 
 
 def lark_env() -> dict[str, str]:
@@ -1990,7 +2010,12 @@ def invoke_codex_once(
     response_path = runtime_dir / "outbox" / f"codex-response-{int(time.time())}.json"
     prompt = render_worker_prompt(runtime_dir, state)
     cmd = codex_command(runtime_dir, model, search_enabled, response_path, extra_config, worker_policy)
-    result = capture_command(cmd, cwd=runtime_dir, stdin_text=prompt)
+    result = capture_command(
+        cmd,
+        cwd=runtime_dir,
+        stdin_text=prompt,
+        timeout_seconds=DEFAULT_WORKER_TICK_TIMEOUT_SECONDS,
+    )
     log_text = f"CMD: {' '.join(shlex.quote(part) for part in cmd)}\n\nPROMPT:\n{prompt}\n\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     write_supervisor_log(runtime_dir, f"codex-{slugify(model)}", log_text)
     combined_output = f"{result.stdout}\n{result.stderr}"
@@ -2107,6 +2132,8 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
         if not args.disable_lark and not state["lark"].get("final_summary_written"):
             if update_lark_doc(runtime_dir, state, generate_final_summary_markdown(state, worker_result)):
                 state["lark"]["final_summary_written"] = True
+    elif worker_status == "waiting_job":
+        state["lifecycle"]["status"] = "waiting_job"
     elif worker_status == "blocked":
         state["lifecycle"]["status"] = "blocked"
     elif worker_status == "failed":
