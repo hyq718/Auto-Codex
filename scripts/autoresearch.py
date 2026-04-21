@@ -353,6 +353,14 @@ def default_state(
             "last_sleep_seconds": 0,
             "consecutive_failures": 0,
             "paused": False,
+            "active_tick": {
+                "running": False,
+                "started_at": "",
+                "model": "",
+                "worker_pid": 0,
+                "response_path": "",
+                "session_log_path": "",
+            },
             "worker_policy": {
                 "sandbox_mode": DEFAULT_WORKER_SANDBOX,
                 "approval_policy": DEFAULT_WORKER_APPROVAL_POLICY,
@@ -459,6 +467,7 @@ def render_worker_prompt(runtime_dir: Path, state: dict[str, Any]) -> str:
         focused_job_ids=focused_job_ids_text,
         jobs_dir=str(runtime_dir / "jobs"),
         notes_dir=str(runtime_dir / "notes"),
+        live_status_path=str(runtime_dir / "notes" / "live_status.md"),
         outbox_dir=str(runtime_dir / "outbox"),
         worker_schema_path=str(SCHEMA_PATH),
         active_model=state["supervisor"]["active_model"],
@@ -517,6 +526,13 @@ def ensure_state_defaults(state: dict[str, Any]) -> dict[str, Any]:
     state["supervisor"].setdefault("last_sleep_seconds", 0)
     state["supervisor"].setdefault("consecutive_failures", 0)
     state["supervisor"].setdefault("paused", False)
+    active_tick = state["supervisor"].setdefault("active_tick", {})
+    active_tick.setdefault("running", False)
+    active_tick.setdefault("started_at", "")
+    active_tick.setdefault("model", "")
+    active_tick.setdefault("worker_pid", 0)
+    active_tick.setdefault("response_path", "")
+    active_tick.setdefault("session_log_path", "")
 
     state["progress"].setdefault("summary", "")
     state["progress"].setdefault("last_worker_status", "")
@@ -679,6 +695,46 @@ def write_execution_markdown(runtime_dir: Path, state: dict[str, Any]) -> None:
     write_text(runtime_dir / "notes" / "resume_status.md", "\n".join(lines))
 
 
+def write_live_status_markdown(runtime_dir: Path, state: dict[str, Any]) -> None:
+    live = collect_live_worker_snapshot(runtime_dir, state)
+    lines = [
+        "# Live Status",
+        "",
+        f"Updated: {now_iso()}",
+        "",
+        f"- lifecycle: {state.get('lifecycle', {}).get('status', 'unknown')}",
+        f"- summary: {state.get('progress', {}).get('summary', '') or 'none'}",
+        f"- next_sleep_seconds: {state.get('progress', {}).get('next_sleep_seconds', 0)}",
+        "",
+    ]
+    if live.get("running"):
+        lines.extend(
+            [
+                "## In-Flight Worker Burst",
+                "",
+                f"- started_at: {live.get('started_at', '') or 'none'}",
+                f"- elapsed: {live.get('elapsed', '') or '0s'}",
+                f"- model: {live.get('model', '') or 'none'}",
+                f"- worker_pid: {live.get('worker_pid', 'none')}",
+                f"- session_log_path: {live.get('session_log_path', '') or 'none'}",
+                f"- current_action: {live.get('current_action', '') or 'none'}",
+                f"- next_hint: {live.get('next_hint', '') or 'none'}",
+                "",
+                "## Recent Actions",
+                "",
+            ]
+        )
+        recent_actions = live.get("recent_actions", [])
+        if recent_actions:
+            lines.extend(f"- {item}" for item in recent_actions)
+        else:
+            lines.append("- none recorded yet")
+    else:
+        lines.extend(["## In-Flight Worker Burst", "", "- none"])
+    lines.append("")
+    write_text(runtime_dir / "notes" / "live_status.md", "\n".join(lines))
+
+
 def save_state(runtime_dir: Path, state: dict[str, Any]) -> None:
     state = ensure_state_defaults(state)
     merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=True)
@@ -691,6 +747,7 @@ def save_state(runtime_dir: Path, state: dict[str, Any]) -> None:
     write_plan_markdown(runtime_dir, state)
     write_plan_preview_markdown(runtime_dir, state)
     write_execution_markdown(runtime_dir, state)
+    write_live_status_markdown(runtime_dir, state)
 
 
 def load_state(runtime_dir: Path) -> dict[str, Any]:
@@ -850,7 +907,7 @@ def clamp_sleep_seconds(value: int | float) -> int:
 def format_sleep_duration(seconds: int | float) -> str:
     try:
         total_seconds = max(0, int(seconds))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         total_seconds = 0
     hours, remainder = divmod(total_seconds, 3600)
     minutes, secs = divmod(remainder, 60)
@@ -1573,6 +1630,13 @@ def render_plan_preview(runtime_dir: Path) -> str:
 def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
     state = load_state(runtime_dir)
     daemon = daemon_snapshot(runtime_dir)
+    live = collect_live_worker_snapshot(runtime_dir, state)
+    latest_progress = state["progress"].get("summary", "").strip() or "No progress recorded yet."
+    if live.get("running"):
+        latest_progress = (
+            "A worker burst is currently in flight. "
+            f"Last completed summary: {latest_progress}"
+        )
     goal = state["mission"].get("title", Path(runtime_dir).name)
     waiting_reason = state["lifecycle"].get("stop_reason", "").strip()
     lifecycle = "paused" if state["supervisor"].get("paused") else state["lifecycle"].get("status", "")
@@ -1596,6 +1660,7 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
 
     header = "**Auto-Codex Sync**" if flavor == "sync" else "**Auto-Codex Status**"
     wait_banner: list[str] = []
+    live_sections: list[str] = []
     if daemon.get("running") and has_delayed_wake(state):
         banner_line = "Auto-Codex is waiting on a real delayed wake and will resume automatically."
         if lifecycle != "waiting_job":
@@ -1606,6 +1671,26 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
             f"- will come back in: {format_sleep_duration(state.get('progress', {}).get('next_sleep_seconds', 0))}",
             f"- planned wake at: {state.get('progress', {}).get('planned_wake_at', '') or 'none'}",
             f"- reason: {state.get('progress', {}).get('sleep_reason', '') or 'none'}",
+            "",
+        ]
+    if live.get("running"):
+        live_sections = [
+            "**Live Worker Burst**",
+            f"- in flight: yes",
+            f"- started at: {live.get('started_at', '') or 'none'}",
+            f"- elapsed: {live.get('elapsed', '') or '0s'}",
+            f"- model: {live.get('model', '') or 'none'}",
+            f"- worker pid: {live.get('worker_pid', 'none')}",
+            f"- session log: {live.get('session_log_path', '') or 'none'}",
+            "",
+            "**What It Just Did**",
+            "\n".join(f"- {item}" for item in live.get("recent_actions", [])) if live.get("recent_actions") else "- none recorded yet",
+            "",
+            "**What It Is Doing**",
+            f"- {live.get('current_action', '') or 'Waiting for the worker burst to finish.'}",
+            "",
+            "**What It Plans Next**",
+            f"- {live.get('next_hint', '') or 'Will return a structured handoff when the burst ends.'}",
             "",
         ]
     sections = [
@@ -1619,8 +1704,9 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
         "\n".join(plan_lines),
         "",
         f"**Latest Progress**",
-        state["progress"].get("summary", "").strip() or "No progress recorded yet.",
+        latest_progress,
         "",
+        *live_sections,
         f"**Current Phase**",
         f"- title: {current_phase.get('title', '') or 'none'}",
         f"- goal: {current_phase.get('goal', '') or 'none'}",
@@ -1781,6 +1867,258 @@ def daemon_snapshot(runtime_dir: Path) -> dict[str, Any]:
         "running": running,
         "log_path": str(daemon_log_path(runtime_dir)),
     }
+
+
+def active_tick_state(state: dict[str, Any]) -> dict[str, Any]:
+    return state.get("supervisor", {}).get("active_tick", {})
+
+
+def read_proc_children(pid: int) -> list[int]:
+    children_path = Path(f"/proc/{pid}/task/{pid}/children")
+    if pid <= 0 or not children_path.exists():
+        return []
+    try:
+        raw = read_text(children_path).strip()
+    except OSError:
+        return []
+    children: list[int] = []
+    for item in raw.split():
+        try:
+            children.append(int(item))
+        except ValueError:
+            continue
+    return children
+
+
+def descendant_pids(pid: int, max_depth: int = 3) -> list[int]:
+    if pid <= 0 or max_depth <= 0:
+        return []
+    pending = [(pid, 0)]
+    seen: set[int] = set()
+    descendants: list[int] = []
+    while pending:
+        current, depth = pending.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        if depth > 0:
+            descendants.append(current)
+        if depth >= max_depth:
+            continue
+        for child in read_proc_children(current):
+            pending.append((child, depth + 1))
+    return descendants
+
+
+def session_log_path_from_pid(pid: int) -> str:
+    fd_dir = Path(f"/proc/{pid}/fd")
+    if pid <= 0 or not fd_dir.exists():
+        return ""
+    try:
+        entries = list(fd_dir.iterdir())
+    except OSError:
+        return ""
+    for entry in entries:
+        try:
+            target = os.readlink(entry)
+        except OSError:
+            continue
+        if "/.codex/sessions/" in target and target.endswith(".jsonl"):
+            return target
+    return ""
+
+
+def session_log_path_from_pid_tree(pid: int) -> str:
+    for candidate in [pid, *descendant_pids(pid)]:
+        target = session_log_path_from_pid(candidate)
+        if target:
+            return target
+    return ""
+
+
+def maybe_parse_json(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def parse_session_entries(session_log_path: str, max_lines: int = 240) -> list[dict[str, Any]]:
+    if not session_log_path:
+        return []
+    entries: list[dict[str, Any]] = []
+    for raw_line in tail_lines(Path(session_log_path), max_lines):
+        try:
+            payload = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            entries.append(payload)
+    return entries
+
+
+def shorten_path(raw: str, max_parts: int = 3) -> str:
+    if not raw:
+        return "unknown"
+    path = Path(raw)
+    parts = path.parts[-max_parts:]
+    return str(Path(*parts)) if parts else raw
+
+
+def summarize_exec_command_intent(cmd: str) -> str:
+    lowered = cmd.lower()
+    path_match = re.search(r"(/[^\"'\s]+)", cmd)
+    hinted_path = shorten_path(path_match.group(1)) if path_match else ""
+    if "sbatch --parsable" in lowered:
+        return "Submitting a Slurm smoke job."
+    if "squeue " in lowered or "sacct " in lowered:
+        return "Checking cluster job status."
+    if "sinfo" in lowered:
+        return "Inspecting cluster partitions."
+    if "python3 -m py_compile" in lowered or "bash -n " in lowered:
+        return "Validating newly written smoke scripts."
+    if "sed -n " in lowered and hinted_path:
+        return f"Reading {hinted_path}."
+    if lowered.startswith("cat ") and hinted_path:
+        return f"Reading {hinted_path}."
+    if "rg -n " in lowered:
+        return "Searching the codebase for the next integration point."
+    if "git " in lowered and ("status" in lowered or "rev-parse" in lowered or "log " in lowered):
+        return "Inspecting the repository baseline and commit state."
+    if "python - <<'py'" in lowered or "python - <<" in lowered or "torchrun " in lowered:
+        return "Running a local Python or torch smoke check."
+    return f"Running `{truncate_text(cmd, 120)}`."
+
+
+def summarize_exec_command_result(cmd: str, output: str) -> str:
+    lowered = cmd.lower()
+    if "sbatch --parsable" in lowered:
+        match = re.search(r"\b(\d{4,})\b", output)
+        if match:
+            return f"Submitted Slurm job `{match.group(1)}`."
+        return "Submitted a Slurm job."
+    if "python3 -m py_compile" in lowered or "bash -n " in lowered:
+        return "Validated the new smoke runner and sbatch wrapper."
+    if "sinfo" in lowered:
+        return "Confirmed Slurm partitions and cluster availability."
+    if "squeue " in lowered or "sacct " in lowered:
+        return "Checked the submitted job status."
+    if "sed -n " in lowered:
+        path_match = re.search(r"(/[^\"'\s]+)", cmd)
+        return f"Read {shorten_path(path_match.group(1))}." if path_match else "Read the requested source file."
+    if lowered.startswith("cat "):
+        path_match = re.search(r"(/[^\"'\s]+)", cmd)
+        return f"Read {shorten_path(path_match.group(1))}." if path_match else "Read the requested file."
+    if "rg -n " in lowered:
+        return "Searched the tree for the requested symbols and paths."
+    if "git " in lowered and ("status" in lowered or "rev-parse" in lowered or "log " in lowered):
+        return "Recorded the baseline repository state."
+    if "python - <<'py'" in lowered or "python - <<" in lowered or "torchrun " in lowered:
+        return "Ran a local Python smoke check."
+    return summarize_exec_command_intent(cmd)
+
+
+def summarize_patch_intent(raw_patch: str, *, completed: bool) -> str:
+    files = re.findall(r"\*\*\* (?:Add|Update|Delete) File: (.+)", raw_patch)
+    if not files:
+        return "Editing runtime artifacts." if completed else "Preparing runtime file edits."
+    labels = ", ".join(shorten_path(path, max_parts=2) for path in files[:3])
+    if len(files) > 3:
+        labels = f"{labels}, +{len(files) - 3} more"
+    verb = "Updated" if completed else "Updating"
+    return f"{verb} {labels}."
+
+
+def summarize_tool_invocation(tool_name: str, raw_arguments: Any, *, completed: bool = False, output: str = "") -> str:
+    parsed = maybe_parse_json(raw_arguments)
+    if tool_name == "exec_command":
+        cmd = parsed.get("cmd", "") if isinstance(parsed, dict) else str(parsed)
+        return summarize_exec_command_result(cmd, output) if completed else summarize_exec_command_intent(cmd)
+    if tool_name == "apply_patch":
+        raw_patch = raw_arguments if isinstance(raw_arguments, str) else str(raw_arguments)
+        return summarize_patch_intent(raw_patch, completed=completed)
+    if tool_name == "update_plan":
+        payload = parsed if isinstance(parsed, dict) else {}
+        active_step = next((item.get("step", "") for item in payload.get("plan", []) if item.get("status") == "in_progress"), "")
+        explanation = str(payload.get("explanation", "")).strip()
+        if completed:
+            return truncate_text(active_step or explanation or "Updated the execution plan.", 180)
+        return truncate_text(active_step or explanation or "Updating the execution plan.", 180)
+    label = tool_name.replace("_", " ")
+    return f"Completed {label}." if completed else f"Running {label}."
+
+
+def collect_live_worker_snapshot(runtime_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    active_tick = active_tick_state(state)
+    if not active_tick.get("running"):
+        return {}
+
+    worker_pid = int(active_tick.get("worker_pid") or 0)
+    session_log_path = str(active_tick.get("session_log_path", "")).strip()
+    if worker_pid > 0 and not session_log_path:
+        session_log_path = session_log_path_from_pid_tree(worker_pid)
+
+    entries = parse_session_entries(session_log_path)
+    pending_calls: dict[str, tuple[str, Any]] = {}
+    recent_actions: list[str] = []
+    current_action = "The worker burst is running."
+    next_hint = state.get("execution", {}).get("next_action", {}).get("summary", "") or "The worker will return a more specific handoff when the burst ends."
+    last_entry_type = ""
+
+    for entry in entries:
+        entry_type = str(entry.get("type", ""))
+        payload = entry.get("payload", {}) if isinstance(entry.get("payload", {}), dict) else {}
+        if entry_type != "response_item":
+            continue
+        payload_type = str(payload.get("type", ""))
+        last_entry_type = payload_type or last_entry_type
+        if payload_type in {"function_call", "custom_tool_call"}:
+            tool_name = str(payload.get("name", ""))
+            raw_arguments = payload.get("arguments", payload.get("input", ""))
+            pending_calls[str(payload.get("call_id", ""))] = (tool_name, raw_arguments)
+            current_action = summarize_tool_invocation(tool_name, raw_arguments, completed=False)
+        elif payload_type in {"function_call_output", "custom_tool_call_output"}:
+            call_id = str(payload.get("call_id", ""))
+            tool_name, raw_arguments = pending_calls.pop(call_id, ("tool", ""))
+            summary = summarize_tool_invocation(tool_name, raw_arguments, completed=True, output=str(payload.get("output", "")))
+            if summary and (not recent_actions or recent_actions[-1] != summary):
+                recent_actions.append(summary)
+            current_action = "Preparing the next concrete action from the latest tool results."
+        elif payload_type == "reasoning":
+            current_action = "Reasoning over the latest results and preparing the structured handoff."
+
+        if payload_type == "function_call" and str(payload.get("name", "")) == "update_plan":
+            parsed_arguments = maybe_parse_json(payload.get("arguments", ""))
+            if isinstance(parsed_arguments, dict):
+                steps = parsed_arguments.get("plan", [])
+                candidate = next((item.get("step", "") for item in steps if item.get("status") in {"in_progress", "pending"}), "")
+                explanation = str(parsed_arguments.get("explanation", "")).strip()
+                next_hint = candidate or explanation or next_hint
+
+    if pending_calls:
+        _, (tool_name, raw_arguments) = next(reversed(pending_calls.items()))
+        current_action = summarize_tool_invocation(tool_name, raw_arguments, completed=False)
+    elif last_entry_type not in {"function_call", "custom_tool_call"}:
+        current_action = "Summarizing completed work and preparing the structured JSON handoff."
+
+    started_at = str(active_tick.get("started_at", "")).strip()
+    snapshot = {
+        "running": True,
+        "started_at": started_at,
+        "elapsed": format_sleep_duration(seconds_since(started_at) if started_at else 0),
+        "model": str(active_tick.get("model", "")).strip() or state.get("supervisor", {}).get("active_model", ""),
+        "worker_pid": worker_pid or "none",
+        "session_log_path": session_log_path or "none",
+        "current_action": current_action,
+        "recent_actions": recent_actions[-5:],
+        "next_hint": truncate_text(next_hint, 220),
+        "last_activity_at": datetime.fromtimestamp(Path(session_log_path).stat().st_mtime).astimezone().isoformat(timespec="seconds")
+        if session_log_path and Path(session_log_path).exists()
+        else "",
+    }
+    return snapshot
 
 
 def parse_iso_timestamp(value: str) -> float:
@@ -2288,12 +2626,39 @@ def invoke_codex_once(
     response_path = runtime_dir / "outbox" / f"codex-response-{int(time.time())}.json"
     prompt = render_worker_prompt(runtime_dir, state)
     cmd = codex_command(runtime_dir, model, search_enabled, response_path, extra_config, worker_policy)
-    result = capture_command(
+    command_env = os.environ.copy()
+    process = subprocess.Popen(  # noqa: S603
         cmd,
-        cwd=runtime_dir,
-        stdin_text=prompt,
-        timeout_seconds=DEFAULT_WORKER_TICK_TIMEOUT_SECONDS,
+        cwd=str(runtime_dir),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=command_env,
     )
+    active_tick = state["supervisor"]["active_tick"]
+    active_tick["worker_pid"] = process.pid
+    active_tick["model"] = model
+    active_tick["response_path"] = str(response_path)
+    session_log_path = ""
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not session_log_path:
+        session_log_path = session_log_path_from_pid_tree(process.pid)
+        if session_log_path:
+            break
+        time.sleep(0.1)
+    if session_log_path:
+        active_tick["session_log_path"] = session_log_path
+    save_state(runtime_dir, state)
+    try:
+        stdout, stderr = process.communicate(input=prompt, timeout=DEFAULT_WORKER_TICK_TIMEOUT_SECONDS)
+        result = subprocess.CompletedProcess(cmd, process.returncode, stdout=stdout, stderr=stderr)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        timeout_note = f"Command timed out after {DEFAULT_WORKER_TICK_TIMEOUT_SECONDS} seconds."
+        stderr = f"{stderr}\n{timeout_note}".strip()
+        result = subprocess.CompletedProcess(cmd, 124, stdout=stdout, stderr=stderr)
     log_text = f"CMD: {' '.join(shlex.quote(part) for part in cmd)}\n\nPROMPT:\n{prompt}\n\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     write_supervisor_log(runtime_dir, f"codex-{slugify(model)}", log_text)
     combined_output = f"{result.stdout}\n{result.stderr}"
@@ -2340,6 +2705,23 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
         "source": str(worker_policy.get("source", "")),
         "session_source": str(worker_policy.get("session_source", "")),
     }
+    state["supervisor"]["active_tick"] = {
+        "running": True,
+        "started_at": state["supervisor"]["last_tick_at"],
+        "model": state["supervisor"]["active_model"],
+        "worker_pid": 0,
+        "response_path": "",
+        "session_log_path": "",
+    }
+    append_event(
+        runtime_dir,
+        "tick_started",
+        {
+            "model": state["supervisor"]["active_model"],
+            "worker_policy": deepcopy(state["supervisor"]["worker_policy"]),
+        },
+    )
+    save_state(runtime_dir, state)
 
     worker_result: dict[str, Any] | None = None
     last_output = ""
@@ -2366,6 +2748,14 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
 
     if worker_result is None:
         state["supervisor"]["consecutive_failures"] += 1
+        state["supervisor"]["active_tick"] = {
+            "running": False,
+            "started_at": "",
+            "model": "",
+            "worker_pid": 0,
+            "response_path": "",
+            "session_log_path": "",
+        }
         state["progress"]["summary"] = "Codex tick failed."
         state["progress"]["next_sleep_seconds"] = DEFAULT_INTERVAL_SECONDS
         state["progress"]["sleep_reason"] = "Worker tick failed; fall back to the default one-hour polling interval."
@@ -2379,6 +2769,14 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     merge_plan(state, worker_result["plan_updates"])
     acknowledge_inputs(runtime_dir, state, worker_result["acknowledged_input_ids"], "Acknowledged by worker.")
     state["supervisor"]["consecutive_failures"] = 0
+    state["supervisor"]["active_tick"] = {
+        "running": False,
+        "started_at": "",
+        "model": "",
+        "worker_pid": 0,
+        "response_path": "",
+        "session_log_path": "",
+    }
     state["progress"]["summary"] = worker_result["summary"]
     state["progress"]["last_worker_status"] = worker_result["status"]
     state["progress"]["artifacts_updated"] = worker_result["artifacts_updated"]
@@ -3058,6 +3456,7 @@ def daemon_status(args: argparse.Namespace) -> int:
         "lifecycle_status": state["lifecycle"]["status"] if state else "missing",
         "summary": state["progress"]["summary"] if state else "",
         "inputs": state.get("inputs", {}) if state else {},
+        "active_tick": collect_live_worker_snapshot(runtime_dir, state) if state else {},
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False) if args.json else "\n".join(f"{k}: {v}" for k, v in payload.items()))
     return 0

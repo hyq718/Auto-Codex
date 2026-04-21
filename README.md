@@ -237,6 +237,26 @@ In practice this means:
 - status and sync views should explain how the current next step will be executed
 - worker responses should keep `next_action.read_ladder` concrete enough to show directly to the user
 
+### Live In-Flight Visibility
+
+Long worker bursts should not look idle from the foreground conversation.
+
+In practice:
+
+- the supervisor should mark a tick as in-flight before the worker returns
+- `mode-sync` and `daemon-status` should surface live progress from the active worker burst when available
+- workers should keep `notes/live_status.md` current during long bursts so the user can inspect what was done, what is being done, and what comes next
+
+### Enter And Exit Session Mode
+
+`Auto-Codex` also supports a lightweight active-runtime marker so wrapper commands can keep pointing at the same runtime until you explicitly leave it.
+
+- `python3 skills/auto-codex/scripts/auto_codex.py mode-enter /path/to/auto-codex`
+- `python3 skills/auto-codex/scripts/auto_codex.py mode-active`
+- `python3 skills/auto-codex/scripts/auto_codex.py mode-exit`
+
+While the marker is active, wrapper commands such as `mode-sync` and `mode-update` can omit the runtime directory and default to the active run.
+
 ## Runtime Layout
 
 Inside the project you are researching, `Auto-Codex` will create `./auto-codex`.

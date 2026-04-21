@@ -16,6 +16,8 @@ python3 scripts/auto_codex.py mode-start --mission /path/to/autoresearch.md
 python3 scripts/auto_codex.py mode-approve-plan
 python3 scripts/auto_codex.py mode-status
 python3 scripts/auto_codex.py mode-update --message "New direction"
+python3 scripts/auto_codex.py mode-enter /path/to/auto-codex
+python3 scripts/auto_codex.py mode-exit
 ```
 
 If the repo is installed somewhere else, set `AUTO_CODEX_REPO` first so the wrapper can find it.
@@ -30,6 +32,7 @@ If `RUNTIME_DIR` is omitted, the runtime defaults to `./auto-codex` under the cu
 5. Use `mode-plan` and `mode-jobs` when the user asks for narrower views.
 6. Use `mode-pause`, `mode-resume`, or `mode-stop` to control runtime execution state.
 7. Fall back to lower-level runtime commands only when you need daemon, Slurm, or raw JSON inspection.
+8. Use `mode-enter`, `mode-active`, and `mode-exit` when you want wrapper commands to stay pinned to one active runtime until you explicitly leave it.
 
 ## Command mapping
 
@@ -55,6 +58,7 @@ Read [references/commands.md](references/commands.md) only when you need the exa
 - Treat `mode-start` as a plan-preview entrypoint, not as immediate execution.
 - Treat `mode-update` as the bridge from chat into the runtime inbox.
 - Reuse the same runtime directory across turns; the persistent state is the real source of continuity.
+- `mode-enter` pins the wrapper to one active runtime; `mode-exit` clears that pin explicitly.
 - Prefer the default `./auto-codex` runtime under the user's current project directory unless the user explicitly asks for another location.
 - Use `status --json`, `daemon-status --json`, `list-inputs --json`, or `list-jobs --json` only when you need machine-readable inspection.
 - Use `start` or `daemon-start` only when you are intentionally running the underlying supervisor loop.
