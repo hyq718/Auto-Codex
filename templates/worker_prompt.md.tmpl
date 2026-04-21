@@ -23,13 +23,16 @@ Rules:
 - Do not scan the entire jobs directory by default. Only open detailed job JSON files or logs for the focused jobs first, and only widen scope if the current step clearly requires it.
 - Work in the runtime root and any mission-authorized paths only.
 - If you submit a cluster job, create or update a JSON file in `$jobs_dir` named `<job_id>.json`.
+- When cluster hardware is not user-pinned, prefer faster time-to-signal over a single favorite GPU type: use a comma-separated list of multiple acceptable stable GPU partitions or card classes when the scheduler supports it instead of queueing behind one device family.
 - Keep the on-disk plan current. Update `$plan_path` if the plan meaningfully changes.
 - Keep the recovery packet current. Every response must update `current_phase`, `phase_plan`, and `next_action` so a future worker can resume without broad rereading.
 - Keep the user-facing explanation current. `phase_plan` and especially `next_action.read_ladder` must be concrete enough to show the user exactly how you will execute the next step.
 - Keep the live status current during long bursts. Update `$live_status_path` whenever a concrete subtask finishes or the active direction changes, using concise `Done`, `Doing`, `Next`, `Artifacts`, and `Blockers` sections so the user can inspect progress before the final JSON handoff.
 - If you produce a useful handoff, update `$notes_dir/latest_summary.md`.
 - If there is a meaningful user-visible progress update, include it in `lark_update_markdown`.
+- If a job failure exposes a straightforward local remediation such as a dynamic rendezvous port, a broader hardware/partition choice, or a small wrapper fix, apply that remediation and keep `status="working"` instead of parking in `waiting_job`.
 - If a long-running job is now the critical path, return `status="waiting_job"` with a realistic `next_sleep_seconds` and explain the estimate in `sleep_reason`.
+- Only return `status="waiting_job"` when at least one currently queued or running job is expected to produce the next useful signal and no higher-value local remediation is immediately available.
 - If no external wait is blocking progress, keep `status="working"` and return `next_sleep_seconds=0` so the supervisor immediately launches the next burst.
 - Reserve delayed sleep for real external waits, explicit retry/backoff, or a waiting job.
 - The sleep strategy is dual-mode: fall back to waking within 1 hour when uncertain, but prefer a shorter estimate when logs expose enough progress information to predict the next useful checkpoint.

@@ -60,6 +60,7 @@ Read [references/commands.md](references/commands.md) only when you need the exa
 - Reuse the same runtime directory across turns; the persistent state is the real source of continuity.
 - `mode-enter` pins the wrapper to one active runtime; `mode-exit` clears that pin explicitly.
 - Prefer the default `./auto-codex` runtime under the user's current project directory unless the user explicitly asks for another location.
+- For Slurm work, if the user did not pin one exact GPU type, prefer faster signal by using multiple acceptable GPU partitions or card classes instead of a single narrow queue.
 - Use `status --json`, `daemon-status --json`, `list-inputs --json`, or `list-jobs --json` only when you need machine-readable inspection.
 - Use `start` or `daemon-start` only when you are intentionally running the underlying supervisor loop.
 - Worker bursts inherit the current Codex session's sandbox and approval settings when possible. If the user explicitly needs unrestricted worker execution, pass `--worker-full-access` through to the underlying runtime command.

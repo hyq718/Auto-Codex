@@ -40,9 +40,33 @@ MODE_RECENT_EVENT_LIMIT = 8
 DEFAULT_RUNTIME_DIRNAME = "auto-codex"
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM}
 GLOBAL_STOP_REQUESTED = False
-JOB_TERMINAL_STATUSES = {"completed", "succeeded", "success", "done", "cancelled", "stopped"}
-JOB_ATTENTION_STATUSES = {"failed", "error", "timeout", "oom", "not_in_queue"}
-JOB_RUNNING_STATUSES = {"submitted", "queued", "pending", "running", "r", "pd"}
+JOB_TERMINAL_STATUSES = {"completed", "succeeded", "success", "done", "cancelled", "stopped", "not_in_queue"}
+JOB_ATTENTION_STATUSES = {
+    "failed",
+    "error",
+    "timeout",
+    "oom",
+    "out_of_memory",
+    "node_fail",
+    "preempted",
+    "boot_fail",
+    "deadline",
+    "revoked",
+}
+JOB_RUNNING_STATUSES = {
+    "submitted",
+    "queued",
+    "pending",
+    "running",
+    "configuring",
+    "completing",
+    "stage_out",
+    "r",
+    "pd",
+    "cf",
+    "cg",
+    "so",
+}
 MAX_FOCUSED_JOB_COUNT = 5
 VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
@@ -55,6 +79,11 @@ def now_iso() -> str:
 
 def iso_after_seconds(seconds: int) -> str:
     return (datetime.now().astimezone() + timedelta(seconds=max(0, seconds))).isoformat(timespec="seconds")
+
+
+def normalize_job_status(status: str) -> str:
+    lowered = status.strip().lower().rstrip("+")
+    return re.split(r"[\s+]+", lowered, maxsplit=1)[0] if lowered else ""
 
 
 def slugify(value: str) -> str:
@@ -1144,7 +1173,7 @@ def choose_sleep_policy(runtime_dir: Path, state: dict[str, Any], worker_result:
 
 
 def job_status_bucket(status: str) -> int:
-    lowered = status.strip().lower()
+    lowered = normalize_job_status(status)
     if lowered in JOB_ATTENTION_STATUSES:
         return 0
     if lowered in JOB_RUNNING_STATUSES:
@@ -1152,6 +1181,14 @@ def job_status_bucket(status: str) -> int:
     if lowered in JOB_TERMINAL_STATUSES:
         return 3
     return 2
+
+
+def job_is_active(metadata: dict[str, Any]) -> bool:
+    return normalize_job_status(str(metadata.get("status", ""))) in JOB_RUNNING_STATUSES
+
+
+def has_active_jobs(state: dict[str, Any]) -> bool:
+    return any(job_is_active(metadata) for metadata in state.get("jobs", {}).values())
 
 
 def iso_timestamp_rank(value: str) -> float:
@@ -1202,7 +1239,7 @@ def select_focused_job_ids(runtime_dir: Path, state: dict[str, Any], limit: int 
 
     active_sorted = sorted(jobs.items(), key=lambda item: job_sort_key(item[1]))
     for job_id, metadata in active_sorted:
-        status = str(metadata.get("status", "")).strip().lower()
+        status = normalize_job_status(str(metadata.get("status", "")))
         if status in JOB_TERMINAL_STATUSES:
             continue
         if job_id not in chosen:
@@ -1650,6 +1687,11 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
         waiting_reason = state["progress"].get("summary", "").strip()
     if not waiting_reason:
         waiting_reason = "none"
+    runtime_health: list[str] = []
+    if lifecycle in {"running", "waiting_job"} and not daemon.get("running") and not live.get("running"):
+        runtime_health.append("supervisor is not running; the visible state may be stale until the daemon is restarted.")
+    if lifecycle == "waiting_job" and not has_active_jobs(state):
+        runtime_health.append("no tracked jobs are currently queued or running; the previous waiting_job state is stale and should be resumed immediately.")
     execution = state.get("execution", {})
     current_phase = execution.get("current_phase", {})
     next_action = execution.get("next_action", {})
@@ -1706,6 +1748,7 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
         f"**Latest Progress**",
         latest_progress,
         "",
+        *(["**Runtime Health**", *[f"- {item}" for item in runtime_health], ""] if runtime_health else []),
         *live_sections,
         f"**Current Phase**",
         f"- title: {current_phase.get('title', '') or 'none'}",
@@ -2147,6 +2190,28 @@ def maybe_capture_squeue(runtime_dir: Path) -> str:
     return result.stdout.strip()
 
 
+def maybe_capture_sacct(runtime_dir: Path, job_ids: list[str]) -> str:
+    cleaned = [job_id.strip() for job_id in job_ids if str(job_id).strip()]
+    if not cleaned:
+        return ""
+    result = capture_command(
+        [
+            "sacct",
+            "-j",
+            ",".join(cleaned),
+            "--format=JobIDRaw,State,ExitCode,Elapsed,NodeList,Partition",
+            "-P",
+            "-n",
+        ],
+        cwd=runtime_dir,
+    )
+    snapshot_path = runtime_dir / "snapshots" / f"sacct-{int(time.time())}.txt"
+    write_text(snapshot_path, result.stdout + ("\nSTDERR:\n" + result.stderr if result.stderr else ""))
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
 def parse_squeue_output(output: str) -> dict[str, dict[str, str]]:
     rows = output.splitlines()
     parsed: dict[str, dict[str, str]] = {}
@@ -2166,6 +2231,28 @@ def parse_squeue_output(output: str) -> dict[str, dict[str, str]]:
             "time": parts[5] if len(parts) > 5 else "",
             "nodes": parts[6] if len(parts) > 6 else "",
             "nodelist": parts[7] if len(parts) > 7 else "",
+        }
+    return parsed
+
+
+def parse_sacct_output(output: str) -> dict[str, dict[str, str]]:
+    parsed: dict[str, dict[str, str]] = {}
+    for row in output.splitlines():
+        parts = row.split("|")
+        if len(parts) < 6:
+            continue
+        job_id = parts[0].strip()
+        if not job_id or "." in job_id:
+            continue
+        raw_state = parts[1].strip()
+        parsed[job_id] = {
+            "job_id": job_id,
+            "state": normalize_job_status(raw_state),
+            "raw_state": raw_state,
+            "exit_code": parts[2].strip(),
+            "elapsed": parts[3].strip(),
+            "nodelist": parts[4].strip(),
+            "partition": parts[5].strip(),
         }
     return parsed
 
@@ -2428,9 +2515,43 @@ def sync_jobs_with_squeue(state: dict[str, Any], queue_snapshot: str) -> None:
             metadata["status"] = parsed[job_id].get("state", metadata.get("status", ""))
             metadata["queue_time"] = parsed[job_id].get("time", "")
             metadata["last_seen_at"] = now_iso()
-        elif metadata.get("status") in {"PD", "R", "submitted", "queued", "running", "pending"}:
+        elif normalize_job_status(str(metadata.get("status", ""))) in JOB_RUNNING_STATUSES:
             metadata["status"] = "not_in_queue"
             metadata["last_seen_at"] = now_iso()
+
+
+def sync_jobs_with_sacct(state: dict[str, Any], sacct_snapshot: str) -> None:
+    if not state.get("jobs"):
+        return
+    parsed = parse_sacct_output(sacct_snapshot)
+    if not parsed:
+        return
+    for job_id, metadata in state["jobs"].items():
+        record = parsed.get(job_id)
+        if not record:
+            continue
+        metadata["status"] = record.get("state", metadata.get("status", ""))
+        metadata["status_raw"] = record.get("raw_state", "")
+        metadata["exit_code"] = record.get("exit_code", "")
+        metadata["elapsed"] = record.get("elapsed", "")
+        metadata["nodelist"] = record.get("nodelist", "")
+        metadata["partition"] = record.get("partition", metadata.get("partition", ""))
+        metadata["last_seen_at"] = now_iso()
+
+
+def maybe_clear_stale_waiting_job(runtime_dir: Path, state: dict[str, Any]) -> bool:
+    if state["lifecycle"].get("status") != "waiting_job":
+        return False
+    if has_active_jobs(state):
+        return False
+    state["lifecycle"]["status"] = "running"
+    state["progress"]["next_sleep_seconds"] = 0
+    state["progress"]["sleep_reason"] = (
+        "The previous waiting_job state became stale because no tracked jobs remain queued or running; continue immediately with the next worker burst."
+    )
+    state["progress"]["planned_wake_at"] = ""
+    append_event(runtime_dir, "waiting_job_became_stale", {"reason": "no_active_jobs"})
+    return True
 
 
 def fetch_lark_doc_markdown(doc_token_or_url: str, runtime_dir: Path) -> tuple[str | None, str]:
@@ -2692,6 +2813,11 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     if queue_snapshot:
         append_event(runtime_dir, "squeue_snapshot", {"lines": queue_snapshot.splitlines()[:20]})
         sync_jobs_with_squeue(state, queue_snapshot)
+    sacct_snapshot = maybe_capture_sacct(runtime_dir, list(state.get("jobs", {}).keys()))
+    if sacct_snapshot:
+        append_event(runtime_dir, "sacct_snapshot", {"lines": sacct_snapshot.splitlines()[:20]})
+        sync_jobs_with_sacct(state, sacct_snapshot)
+    maybe_clear_stale_waiting_job(runtime_dir, state)
 
     models = [state["supervisor"]["active_model"]]
     fallback = state["supervisor"].get("fallback_model", "")
@@ -3269,6 +3395,10 @@ def sync_jobs_command(args: argparse.Namespace) -> int:
     queue_snapshot = maybe_capture_squeue(runtime_dir)
     if queue_snapshot:
         sync_jobs_with_squeue(state, queue_snapshot)
+    sacct_snapshot = maybe_capture_sacct(runtime_dir, list(state.get("jobs", {}).keys()))
+    if sacct_snapshot:
+        sync_jobs_with_sacct(state, sacct_snapshot)
+    maybe_clear_stale_waiting_job(runtime_dir, state)
     save_state(runtime_dir, state)
     payload = list(state.get("jobs", {}).values())
     print(json.dumps(payload, indent=2, ensure_ascii=False) if args.json else "\n".join(f"{item['job_id']}: {item.get('status', '')}" for item in payload))

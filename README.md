@@ -293,6 +293,10 @@ The intended read order is:
 1. read `jobs_focus.md`
 2. open the most relevant job log
 3. search for the exact signal
+
+When launching Slurm jobs and the user has not pinned one exact GPU type, prefer faster time-to-signal: submit across multiple acceptable stable GPU partitions or card classes when the scheduler supports comma-separated partition lists, instead of queueing behind one device family by default.
+
+`waiting_job` is only valid while at least one tracked job is genuinely queued or running. If the queue has gone stale, the runtime should reconcile terminal states and resume active work instead of sleeping on an already-dead job.
 4. read a small local window
 5. only then widen to more logs or more jobs
 
