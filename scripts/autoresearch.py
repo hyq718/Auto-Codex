@@ -28,6 +28,8 @@ DEFAULT_FALLBACK_MODEL = "gpt-5.3-codex-spark"
 DEFAULT_INTERVAL_SECONDS = 3600
 DEFAULT_LARK_POLL_INTERVAL_SECONDS = 7200
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 7200
+DEFAULT_WORKER_SANDBOX = "workspace-write"
+DEFAULT_WORKER_APPROVAL_POLICY = "on-request"
 MIN_SLEEP_SECONDS = 30
 MAX_SLEEP_SECONDS = 3600
 MAX_INPUT_EXCERPT_CHARS = 6000
@@ -41,6 +43,8 @@ JOB_TERMINAL_STATUSES = {"completed", "succeeded", "success", "done", "cancelled
 JOB_ATTENTION_STATUSES = {"failed", "error", "timeout", "oom", "not_in_queue"}
 JOB_RUNNING_STATUSES = {"submitted", "queued", "pending", "running", "r", "pd"}
 MAX_FOCUSED_JOB_COUNT = 5
+VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
+VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
 
 
 def now_iso() -> str:
@@ -209,6 +213,13 @@ def default_state(
             "last_sleep_seconds": 0,
             "consecutive_failures": 0,
             "paused": False,
+            "worker_policy": {
+                "sandbox_mode": DEFAULT_WORKER_SANDBOX,
+                "approval_policy": DEFAULT_WORKER_APPROVAL_POLICY,
+                "dangerous_bypass": False,
+                "source": "default",
+                "session_source": "",
+            },
         },
         "progress": {
             "summary": "Plan preview generated. Waiting for confirmation before execution.",
@@ -1564,18 +1575,100 @@ def detect_model_limit(output: str) -> bool:
     return any(needle in lowered for needle in needles)
 
 
+def locate_current_session_file() -> Path | None:
+    thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if not thread_id:
+        return None
+    sessions_root = Path.home() / ".codex" / "sessions"
+    if not sessions_root.exists():
+        return None
+    matches = sorted(sessions_root.rglob(f"*{thread_id}*.jsonl"))
+    return matches[-1] if matches else None
+
+
+def session_exec_policy() -> dict[str, str]:
+    session_path = locate_current_session_file()
+    if session_path is None or not session_path.exists():
+        return {}
+
+    sandbox_mode = ""
+    approval_policy = ""
+    try:
+        with session_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "turn_context":
+                    continue
+                payload = record.get("payload", {})
+                sandbox_policy = payload.get("sandbox_policy", {})
+                sandbox_value = str(sandbox_policy.get("type", "")).strip()
+                approval_value = str(payload.get("approval_policy", "")).strip()
+                if sandbox_value in VALID_SANDBOX_MODES:
+                    sandbox_mode = sandbox_value
+                if approval_value in VALID_APPROVAL_POLICIES:
+                    approval_policy = approval_value
+    except OSError:
+        return {}
+
+    result: dict[str, str] = {}
+    if sandbox_mode:
+        result["sandbox_mode"] = sandbox_mode
+    if approval_policy:
+        result["approval_policy"] = approval_policy
+    if result:
+        result["source"] = str(session_path)
+    return result
+
+
+def effective_worker_policy(args: argparse.Namespace) -> dict[str, str | bool]:
+    session_policy = session_exec_policy()
+    sandbox_mode = session_policy.get("sandbox_mode", DEFAULT_WORKER_SANDBOX)
+    approval_policy = session_policy.get("approval_policy", DEFAULT_WORKER_APPROVAL_POLICY)
+    source = "session" if session_policy else "default"
+
+    requested_sandbox = getattr(args, "worker_sandbox", "inherit")
+    if requested_sandbox != "inherit":
+        sandbox_mode = requested_sandbox
+        source = "cli_override"
+
+    requested_approval = getattr(args, "worker_approval_policy", "inherit")
+    if requested_approval != "inherit":
+        approval_policy = requested_approval
+        source = "cli_override"
+
+    if getattr(args, "worker_full_access", False):
+        sandbox_mode = "danger-full-access"
+        approval_policy = "never"
+        source = "cli_full_access"
+
+    dangerous_bypass = sandbox_mode == "danger-full-access" and approval_policy == "never"
+    return {
+        "sandbox_mode": sandbox_mode,
+        "approval_policy": approval_policy,
+        "dangerous_bypass": dangerous_bypass,
+        "source": source,
+        "session_source": session_policy.get("source", ""),
+    }
+
+
 def codex_command(
     runtime_dir: Path,
     model: str,
     search_enabled: bool,
     response_path: Path,
     extra_config: list[str],
+    worker_policy: dict[str, str | bool],
 ) -> list[str]:
     cmd = [
         "codex",
         "exec",
         "--skip-git-repo-check",
-        "--full-auto",
         "-C",
         str(runtime_dir),
         "--add-dir",
@@ -1587,6 +1680,15 @@ def codex_command(
         "-o",
         str(response_path),
     ]
+    if bool(worker_policy.get("dangerous_bypass")):
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        sandbox_mode = str(worker_policy.get("sandbox_mode", "")).strip()
+        approval_policy = str(worker_policy.get("approval_policy", "")).strip()
+        if sandbox_mode in VALID_SANDBOX_MODES:
+            cmd.extend(["-s", sandbox_mode])
+        if approval_policy in VALID_APPROVAL_POLICIES:
+            cmd.extend(["-c", f'approval_policy="{approval_policy}"'])
     if search_enabled:
         cmd.append("--search")
     for item in extra_config:
@@ -1883,10 +1985,11 @@ def invoke_codex_once(
     model: str,
     search_enabled: bool,
     extra_config: list[str],
+    worker_policy: dict[str, str | bool],
 ) -> tuple[dict[str, Any] | None, str]:
     response_path = runtime_dir / "outbox" / f"codex-response-{int(time.time())}.json"
     prompt = render_worker_prompt(runtime_dir, state)
-    cmd = codex_command(runtime_dir, model, search_enabled, response_path, extra_config)
+    cmd = codex_command(runtime_dir, model, search_enabled, response_path, extra_config, worker_policy)
     result = capture_command(cmd, cwd=runtime_dir, stdin_text=prompt)
     log_text = f"CMD: {' '.join(shlex.quote(part) for part in cmd)}\n\nPROMPT:\n{prompt}\n\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     write_supervisor_log(runtime_dir, f"codex-{slugify(model)}", log_text)
@@ -1926,6 +2029,14 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     fallback = state["supervisor"].get("fallback_model", "")
     if fallback and fallback not in models:
         models.append(fallback)
+    worker_policy = effective_worker_policy(args)
+    state["supervisor"]["worker_policy"] = {
+        "sandbox_mode": str(worker_policy.get("sandbox_mode", "")),
+        "approval_policy": str(worker_policy.get("approval_policy", "")),
+        "dangerous_bypass": bool(worker_policy.get("dangerous_bypass")),
+        "source": str(worker_policy.get("source", "")),
+        "session_source": str(worker_policy.get("session_source", "")),
+    }
 
     worker_result: dict[str, Any] | None = None
     last_output = ""
@@ -1938,6 +2049,7 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
             model=model,
             search_enabled=args.search,
             extra_config=args.codex_config,
+            worker_policy=worker_policy,
         )
         last_output = output
         if result is not None:
@@ -2112,6 +2224,7 @@ def print_status(args: argparse.Namespace) -> int:
         "status": state["lifecycle"]["status"],
         "last_tick_at": state["supervisor"]["last_tick_at"],
         "active_model": state["supervisor"]["active_model"],
+        "worker_policy": state["supervisor"].get("worker_policy", {}),
         "next_sleep_seconds": state["progress"]["next_sleep_seconds"],
         "sleep_reason": state["progress"].get("sleep_reason", ""),
         "planned_wake_at": state["progress"].get("planned_wake_at", ""),
@@ -2183,6 +2296,9 @@ def mode_start(args: argparse.Namespace) -> int:
             search=args.search,
             disable_lark=args.disable_lark,
             codex_config=args.codex_config,
+            worker_sandbox=args.worker_sandbox,
+            worker_approval_policy=args.worker_approval_policy,
+            worker_full_access=args.worker_full_access,
         )
         return mode_approve_plan(approve_args)
 
@@ -2231,6 +2347,9 @@ def mode_approve_plan(args: argparse.Namespace) -> int:
             search=args.search,
             disable_lark=args.disable_lark,
             codex_config=args.codex_config,
+            worker_sandbox=args.worker_sandbox,
+            worker_approval_policy=args.worker_approval_policy,
+            worker_full_access=args.worker_full_access,
         )
         try:
             daemon_start(daemon_args)
@@ -2351,8 +2470,10 @@ def mode_resume(args: argparse.Namespace) -> int:
     runtime_dir = resolve_runtime_dir(args.runtime_dir)
     state = load_state(runtime_dir)
     state["supervisor"]["paused"] = False
-    if state["lifecycle"].get("status") == "paused":
+    if state["lifecycle"].get("status") in {"paused", "stopped", "blocked", "failed"}:
         state["lifecycle"]["status"] = "running"
+    state["lifecycle"]["stop_requested"] = False
+    state["lifecycle"]["stop_reason"] = ""
     append_event(runtime_dir, "mode_resumed", {})
     save_state(runtime_dir, state)
     print(render_mode_report(runtime_dir, flavor="status"))
@@ -2557,6 +2678,12 @@ def daemon_start(args: argparse.Namespace) -> int:
         cmd.append("--disable-lark")
     for item in args.codex_config:
         cmd.extend(["--codex-config", item])
+    if args.worker_sandbox != "inherit":
+        cmd.extend(["--worker-sandbox", args.worker_sandbox])
+    if args.worker_approval_policy != "inherit":
+        cmd.extend(["--worker-approval-policy", args.worker_approval_policy])
+    if args.worker_full_access:
+        cmd.append("--worker-full-access")
 
     process = subprocess.Popen(  # noqa: S603
         cmd,
@@ -2611,6 +2738,29 @@ def daemon_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_worker_exec_args(parser: argparse.ArgumentParser, *, daemon_help: bool = False) -> None:
+    parser.add_argument(
+        "--worker-sandbox",
+        choices=["inherit", "read-only", "workspace-write", "danger-full-access"],
+        default="inherit",
+        help="Worker sandbox mode. Defaults to inheriting the current Codex session, then falling back to workspace-write.",
+    )
+    parser.add_argument(
+        "--worker-approval-policy",
+        choices=["inherit", "untrusted", "on-failure", "on-request", "never"],
+        default="inherit",
+        help="Worker approval policy. Defaults to inheriting the current Codex session, then falling back to on-request.",
+    )
+    parser.add_argument(
+        "--worker-full-access",
+        action="store_true",
+        help=(
+            "Force worker bursts to run with danger-full-access and approval_policy=never. "
+            "Use this when the worker must edit freely and submit jobs without approval prompts."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Single-file autoresearch runtime for Codex.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2641,6 +2791,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Extra 'key=value' values passed through to codex exec via -c",
     )
+    add_worker_exec_args(start_parser)
     start_parser.set_defaults(func=start_runtime)
 
     status_parser = subparsers.add_parser("status", help="Show runtime status.")
@@ -2687,6 +2838,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Extra 'key=value' values passed through to codex exec via -c when starting the daemon",
     )
+    add_worker_exec_args(mode_start_parser)
     mode_start_parser.set_defaults(func=mode_start)
 
     mode_approve_parser = subparsers.add_parser("mode-approve-plan", help="Approve the current plan preview and enter execution mode.")
@@ -2705,6 +2857,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Extra 'key=value' values passed through to codex exec via -c when starting the daemon",
     )
+    add_worker_exec_args(mode_approve_parser)
     mode_approve_parser.set_defaults(func=mode_approve_plan)
 
     mode_revise_parser = subparsers.add_parser("mode-revise-plan", help="Revise the current plan preview before execution starts.")
@@ -2876,6 +3029,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Extra 'key=value' values passed through to codex exec via -c",
     )
+    add_worker_exec_args(daemon_start_parser)
     daemon_start_parser.set_defaults(func=daemon_start)
 
     daemon_stop_parser = subparsers.add_parser("daemon-stop", help="Stop a background supervisor.")

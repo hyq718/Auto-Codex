@@ -58,3 +58,4 @@ Read [references/commands.md](references/commands.md) only when you need the exa
 - Prefer the default `./auto-codex` runtime under the user's current project directory unless the user explicitly asks for another location.
 - Use `status --json`, `daemon-status --json`, `list-inputs --json`, or `list-jobs --json` only when you need machine-readable inspection.
 - Use `start` or `daemon-start` only when you are intentionally running the underlying supervisor loop.
+- Worker bursts inherit the current Codex session's sandbox and approval settings when possible. If the user explicitly needs unrestricted worker execution, pass `--worker-full-access` through to the underlying runtime command.

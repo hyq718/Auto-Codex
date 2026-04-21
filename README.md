@@ -25,6 +25,8 @@ cd Auto-Codex
 
 Then restart Codex so it can rescan local skills and plugins.
 
+By default, worker bursts inherit the current Codex session's sandbox and approval settings when Auto-Codex is launched from Codex chat. If you need to force unrestricted worker execution, use `--worker-full-access` on the underlying runtime command.
+
 ### 2. Open Codex in the project you want to research
 
 `Auto-Codex` now defaults its runtime to `./auto-codex` under your current working directory.
