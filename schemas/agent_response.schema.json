@@ -45,7 +45,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "properties": {
           "job_id": {
             "type": "string"
@@ -67,7 +67,12 @@
           }
         },
         "required": [
-          "job_id"
+          "job_id",
+          "status",
+          "script",
+          "log_out",
+          "log_err",
+          "notes"
         ]
       }
     },

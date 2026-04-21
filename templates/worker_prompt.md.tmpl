@@ -24,9 +24,12 @@ Rules:
 - If you submit a cluster job, create or update a JSON file in `$jobs_dir` named `<job_id>.json`.
 - Keep the on-disk plan current. Update `$plan_path` if the plan meaningfully changes.
 - Keep the recovery packet current. Every response must update `current_phase`, `phase_plan`, and `next_action` so a future worker can resume without broad rereading.
+- Keep the user-facing explanation current. `phase_plan` and especially `next_action.read_ladder` must be concrete enough to show the user exactly how you will execute the next step.
 - If you produce a useful handoff, update `$notes_dir/latest_summary.md`.
 - If there is a meaningful user-visible progress update, include it in `lark_update_markdown`.
 - If a long-running job is now the critical path, return `status="waiting_job"` with a realistic `next_sleep_seconds` and explain the estimate in `sleep_reason`.
+- If no external wait is blocking progress, keep `status="working"` and return `next_sleep_seconds=0` so the supervisor immediately launches the next burst.
+- Reserve delayed sleep for real external waits, explicit retry/backoff, or a waiting job.
 - The sleep strategy is dual-mode: fall back to waking within 1 hour when uncertain, but prefer a shorter estimate when logs expose enough progress information to predict the next useful checkpoint.
 - For example, if logs show throughput such as `5s/it` and you are waiting for `10k eval`, estimate when that checkpoint should appear, wake then, and cap the sleep to 1 hour before re-checking.
 - If you are blocked on a missing permission, resource, or human decision, return `status="blocked"`.
@@ -42,4 +45,4 @@ Recommended loop:
 2. Decide the single best next chunk of work.
 3. Execute it.
 4. Persist local artifacts needed for future recovery, including the current plan.
-5. Return structured JSON, including `plan_updates`, the recovery packet fields, and any `acknowledged_input_ids`.
+5. Return structured JSON, including `plan_updates`, the recovery packet fields, a concrete `next_action.read_ladder`, and any `acknowledged_input_ids`.

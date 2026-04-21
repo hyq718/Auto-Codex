@@ -31,7 +31,7 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 7200
 DEFAULT_WORKER_SANDBOX = "workspace-write"
 DEFAULT_WORKER_APPROVAL_POLICY = "on-request"
 DEFAULT_WORKER_TICK_TIMEOUT_SECONDS = 1200
-MIN_SLEEP_SECONDS = 30
+MIN_SLEEP_SECONDS = 0
 MAX_SLEEP_SECONDS = 3600
 MAX_INPUT_EXCERPT_CHARS = 6000
 MAX_LOG_ESTIMATE_LINES = 400
@@ -46,6 +46,7 @@ JOB_RUNNING_STATUSES = {"submitted", "queued", "pending", "running", "r", "pd"}
 MAX_FOCUSED_JOB_COUNT = 5
 VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
+CODEX_EXEC_SEARCH_SUPPORT: bool | None = None
 
 
 def now_iso() -> str:
@@ -110,7 +111,152 @@ def extract_doc_urls(markdown: str) -> list[str]:
     return urls
 
 
-def seeded_plan_steps(markdown: str) -> list[dict[str, str]]:
+def extract_path_mentions(markdown: str) -> list[str]:
+    seen: set[str] = set()
+    paths: list[str] = []
+    for match in re.finditer(r"(?<!https:)(?<!http:)(/[A-Za-z0-9._/\-]+)", markdown):
+        candidate = match.group(1).rstrip(".,:;)]}")
+        if len(candidate) < 2:
+            continue
+        if re.match(r"^/[A-Za-z0-9.-]+\.[A-Za-z]{2,}/", candidate):
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            paths.append(candidate)
+    return paths
+
+
+def plan_steps_need_refinement(plan_steps: list[str]) -> bool:
+    if not plan_steps:
+        return True
+    generic_needles = (
+        "read the mission carefully",
+        "extract constraints",
+        "set up the runtime workspace",
+        "identify the next executable unit of work",
+        "run the highest-priority experiment",
+        "record evidence",
+        "queue follow-up work",
+        "repeat until the mission is complete",
+    )
+    generic_hits = sum(1 for step in plan_steps if any(needle in step.lower() for needle in generic_needles))
+    avg_words = sum(len(step.split()) for step in plan_steps) / max(1, len(plan_steps))
+    return generic_hits >= max(2, len(plan_steps) // 2) or avg_words < 10
+
+
+def select_relevant_path(paths: list[str], *, contains: tuple[str, ...] = (), suffixes: tuple[str, ...] = ()) -> str:
+    lowered_contains = tuple(item.lower() for item in contains)
+    lowered_suffixes = tuple(item.lower() for item in suffixes)
+    for path in paths:
+        lowered = path.lower()
+        if lowered_contains and not any(item in lowered for item in lowered_contains):
+            continue
+        if lowered_suffixes and not any(lowered.endswith(item) for item in lowered_suffixes):
+            continue
+        return path
+    return ""
+
+
+def workspace_root_from_paths(paths: list[str], mission_path: Path | None = None) -> str:
+    preferred = (
+        select_relevant_path(paths, contains=("megatron-lm",))
+        or select_relevant_path(paths, contains=("megatron",))
+        or select_relevant_path(paths, contains=("workspace", "repo"))
+        or (paths[0] if paths else "")
+    )
+    if preferred:
+        candidate = Path(preferred)
+        return str(candidate.parent if candidate.suffix else candidate)
+    if mission_path is not None:
+        return str(mission_path.parent)
+    return ""
+
+
+def mission_behavior_targets(markdown: str) -> list[str]:
+    lowered = markdown.lower()
+    targets: list[str] = []
+    if "router" in lowered or "adaptive" in lowered:
+        targets.append("router gating")
+    if "probability" in lowered or "flow" in lowered or "adaptive" in lowered:
+        targets.append("probability-flow mixing")
+    if "ponder" in lowered or "adaptive" in lowered:
+        targets.append("ponder regularization")
+    if "训练" in markdown or "train" in lowered or "forward" in lowered:
+        targets.append("multi-step training forward")
+    if "generate" in lowered or "cache" in lowered or "kv" in lowered or "adaptive" in lowered:
+        targets.append("generation/cache handling")
+    if not targets:
+        targets = [
+            "behavioral invariants",
+            "tensor shapes",
+            "training/inference branches",
+            "acceptance criteria",
+        ]
+    return targets
+
+
+def synthesize_detailed_plan_steps(markdown: str, mission_path: Path | None = None, doc_urls: list[str] | None = None) -> list[str]:
+    doc_urls = doc_urls or []
+    paths = extract_path_mentions(markdown)
+    source_file = select_relevant_path(paths, suffixes=(".py", ".cpp", ".cu", ".cc", ".c", ".go", ".rs", ".ts", ".tsx", ".js"))
+    target_repo = workspace_root_from_paths(paths, mission_path=mission_path)
+
+    behavior_targets = ", ".join(mission_behavior_targets(markdown))
+    lowered = markdown.lower()
+    mentions_sbatch = "sbatch" in lowered
+    mentions_speed = "加速" in markdown or "speed" in lowered or "throughput" in lowered
+    mentions_equivalence = "等价" in markdown or "equivalent" in lowered or "parity" in lowered
+    mentions_megatron = "megatron" in lowered
+
+    if mentions_megatron:
+        step1 = (
+            f"Clone a clean NVIDIA Megatron-LM baseline from the official GitHub repo into {target_repo}, "
+            "record the exact upstream commit, bring up the recommended environment until a minimal baseline run path works, "
+            "and keep the implementation surface isolated from unrelated changes."
+            if target_repo
+            else "Clone a clean NVIDIA Megatron-LM baseline from the official GitHub repo, record the exact upstream commit, "
+            "bring up the recommended environment until a minimal baseline run path works, and isolate the implementation surface from unrelated changes."
+        )
+    else:
+        step1 = (
+            f"Freeze the working baseline under {target_repo}, record exact commits or versions, and isolate the implementation surface from unrelated changes."
+            if target_repo
+            else "Freeze the working baseline, record exact commits or versions, and isolate the implementation surface from unrelated changes."
+        )
+    if source_file:
+        step2 = (
+            f"Reverse-engineer {source_file} into concrete behaviors to preserve: {behavior_targets}."
+        )
+    else:
+        step2 = (
+            f"Reverse-engineer the mission's reference implementation into concrete behaviors to preserve: {behavior_targets}."
+        )
+
+    step3 = (
+        "Choose the minimal target-stack integration seam for a correctness-first port, preferring config plumbing plus a sibling wrapper that keeps the baseline execution path intact unless a direct patch is clearly safer."
+        if mentions_megatron
+        else "Choose the minimal integration seam for a correctness-first implementation while keeping the baseline path intact unless a direct patch is clearly safer."
+    )
+    step4 = (
+        f"Implement the first correctness-first path and add small local equivalence checks that compare forward and loss behavior against the reference{' to preserve ' + ('behavioral parity' if mentions_equivalence else 'core behavior')}."
+    )
+    step5 = (
+        "Optimize the training-critical path only after correctness is established, then use sbatch jobs to measure throughput, functional parity, and regression risk on cluster runs."
+        if mentions_sbatch or mentions_speed or mentions_equivalence
+        else "Run higher-cost experiments only after correctness is established, and measure performance, behavior, and regression risk before broadening scope."
+    )
+    if doc_urls:
+        step6 = (
+            f"Continuously append concrete evidence, open risks, and next actions to {doc_urls[0]} and iterate until the implementation is accepted or a real blocker requires escalation."
+        )
+    else:
+        step6 = (
+            "Continuously append concrete evidence, open risks, and next actions to the designated report sink and iterate until the implementation is accepted or a real blocker requires escalation."
+        )
+    return [step1, step2, step3, step4, step5, step6]
+
+
+def seeded_plan_steps(markdown: str, mission_path: Path | None = None, doc_urls: list[str] | None = None) -> list[dict[str, str]]:
     target_heading = re.compile(r"(plan|priority|workflow|step|步骤|顺序|工作优先级)", re.IGNORECASE)
     headings = re.compile(r"^##\s+(.+)$")
     ordered_item = re.compile(r"^\s*(?:[-*]|\d+\.)\s+(.+?)\s*$")
@@ -128,15 +274,8 @@ def seeded_plan_steps(markdown: str) -> list[dict[str, str]]:
         if item_match:
             plan_steps.append(item_match.group(1))
 
-    if not plan_steps:
-        fallback_steps = [
-            "Read the mission carefully and extract constraints, targets, and reporting sinks.",
-            "Set up the runtime workspace and identify the next executable unit of work.",
-            "Run the highest-priority experiment, coding task, or research action.",
-            "Record evidence, update progress, and queue follow-up work based on results.",
-            "Repeat until the mission is complete or a real blocker requires escalation.",
-        ]
-        plan_steps = fallback_steps
+    if not plan_steps or plan_steps_need_refinement(plan_steps):
+        plan_steps = synthesize_detailed_plan_steps(markdown, mission_path=mission_path, doc_urls=doc_urls)
 
     seeded: list[dict[str, str]] = []
     for index, step in enumerate(plan_steps):
@@ -708,6 +847,31 @@ def clamp_sleep_seconds(value: int | float) -> int:
     return max(MIN_SLEEP_SECONDS, min(MAX_SLEEP_SECONDS, seconds))
 
 
+def format_sleep_duration(seconds: int | float) -> str:
+    try:
+        total_seconds = max(0, int(seconds))
+    except (TypeError, ValueError):
+        total_seconds = 0
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def has_delayed_wake(state: dict[str, Any]) -> bool:
+    try:
+        seconds = int(state.get("progress", {}).get("next_sleep_seconds", 0))
+    except (TypeError, ValueError):
+        seconds = 0
+    return seconds > 0
+
+
 def tail_lines(path: Path, max_lines: int) -> list[str]:
     if not path.exists() or not path.is_file():
         return []
@@ -898,6 +1062,11 @@ def choose_sleep_policy(runtime_dir: Path, state: dict[str, Any], worker_result:
     worker_status = worker_result.get("status", "")
     worker_sleep = clamp_sleep_seconds(worker_result.get("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS))
     worker_reason = str(worker_result.get("sleep_reason", "")).strip()
+
+    if worker_status == "working":
+        if not worker_reason:
+            worker_reason = "No external wait or cluster job is blocking progress; continue immediately with the next worker burst."
+        return 0, worker_reason
 
     if worker_status != "waiting_job":
         if not worker_reason:
@@ -1262,12 +1431,97 @@ def mission_heading_bullets(runtime_dir: Path, keywords: tuple[str, ...]) -> lis
     return matches
 
 
+def inferred_constraints_from_mission(runtime_dir: Path) -> list[str]:
+    mission_path = runtime_dir / "mission.md"
+    if not mission_path.exists():
+        return []
+    markdown = read_text(mission_path)
+    paths = extract_path_mentions(markdown)
+    constraints: list[str] = []
+    editable_root = workspace_root_from_paths(paths, mission_path=mission_path)
+    if editable_root:
+        constraints.append(f"Editable workspace is explicitly scoped to {editable_root}.")
+    if "sbatch" in markdown.lower():
+        constraints.append("Cluster experiments may be launched through sbatch when local validation is insufficient.")
+    doc_urls = extract_doc_urls(markdown)
+    if doc_urls:
+        constraints.append(f"User-visible progress should be kept current in {doc_urls[0]}.")
+    if "/permissions full-access" in markdown.lower() or "full-access" in markdown.lower():
+        constraints.append("Execution may require full-access worker permissions inside the mission-authorized workspace.")
+    return constraints
+
+
+def derive_step_method(runtime_dir: Path, step: str) -> list[str]:
+    mission_path = runtime_dir / "mission.md"
+    markdown = read_text(mission_path) if mission_path.exists() else ""
+    paths = extract_path_mentions(markdown)
+    source_file = select_relevant_path(paths, suffixes=(".py", ".cpp", ".cu", ".cc", ".c", ".go", ".rs", ".ts", ".tsx", ".js"))
+    target_repo = workspace_root_from_paths(paths, mission_path=mission_path) or str(runtime_dir.parent)
+    doc_url = extract_doc_urls(markdown)
+    doc_target = doc_url[0] if doc_url else "the designated report sink"
+    lowered = step.lower()
+
+    if "clone a clean nvidia megatron-lm baseline" in lowered:
+        return [
+            f"Clone a fresh NVIDIA Megatron-LM checkout into {target_repo} from the official GitHub repository, or replace any mixed local tree with a clean upstream baseline before porting.",
+            "Record the exact upstream commit hash plus dependency manifests so later behavior and performance comparisons stay tied to a fixed baseline.",
+            "Create the recommended environment, install the documented dependencies, and run the smallest import or smoke path that proves how the baseline is launched before writing adaptive code.",
+        ]
+    if "freeze the working baseline" in lowered or "record the exact upstream commit" in lowered:
+        return [
+            f"Recreate or verify a clean baseline checkout inside {target_repo}.",
+            "Record the exact upstream commit hash and note any intentional divergence before writing code.",
+            "Confirm the writable surface for the port so unrelated files are not mixed into the implementation branch.",
+        ]
+    if "reverse-engineer" in lowered or "behaviors to preserve" in lowered:
+        source_target = source_file or "the mission's reference implementation"
+        return [
+            f"Re-open {source_target} around the adaptive forward, router, ponder, and generation paths.",
+            "Write down the invariants that must survive the port: tensor flow, loss terms, branch conditions, and cache behavior.",
+            "Convert those findings into a symbol-to-symbol mapping note that points from the reference implementation to the target integration seam.",
+        ]
+    if "integration seam" in lowered or "wrapper" in lowered:
+        return [
+            "Inspect the smallest set of target entry points that can host the feature without deep rewrites.",
+            "Compare wrapper-based integration against direct baseline patching and choose the lower-regret seam.",
+            "Document the chosen seam and the files that will become the initial write surface before changing code.",
+        ]
+    if "equivalence checks" in lowered or "correctness-first" in lowered:
+        return [
+            "Implement the smallest runnable slice first: config knobs, wrapper skeleton, and the first adaptive forward path.",
+            "Add a local harness or toy input path that checks forward outputs, loss terms, or routing behavior against the reference.",
+            "Only widen the implementation after the first equivalence check produces an interpretable result.",
+        ]
+    if "sbatch" in lowered or "optimize" in lowered or "throughput" in lowered:
+        return [
+            "Keep the optimization pass gated on correctness so speed work does not hide functional regressions.",
+            "Prepare sbatch jobs that isolate throughput, parity, and failure-signal checks with explicit logs and metadata.",
+            "Use the first cluster results to decide whether to continue optimizing, revert, or narrow the hot path.",
+        ]
+    if "feishu" in lowered or "progress" in lowered or "evidence" in lowered:
+        return [
+            f"Append concrete evidence, open risks, and immediate next actions to {doc_target}.",
+            "Keep every update tied to a code change, measurement, or decision so the report can serve as an audit trail.",
+            "Use the recorded evidence to decide whether the next loop should deepen implementation, run experiments, or escalate a blocker.",
+        ]
+    return [
+        "Read the smallest mission and state artifacts needed to start the step without broad rereading.",
+        "Execute one concrete, testable chunk that advances the active step instead of re-planning from scratch.",
+        "Record the result and the exact next move so the following worker or user update can resume cleanly.",
+    ]
+
+
 def render_plan_preview(runtime_dir: Path) -> str:
     state = load_state(runtime_dir)
     constraints = mission_heading_bullets(runtime_dir, ("constraint", "限制", "requirement", "要求"))
+    if not constraints:
+        constraints = inferred_constraints_from_mission(runtime_dir)
     assumptions = mission_heading_bullets(runtime_dir, ("assumption", "假设"))
     risks = mission_heading_bullets(runtime_dir, ("risk", "question", "open question", "风险", "问题"))
     preview = state.get("planning", {}).get("preview", {})
+    preview_items = preview_plan_items(state)
+    first_step = preview_items[0]["step"] if preview_items else ""
+    first_step_method = derive_step_method(runtime_dir, first_step) if first_step else []
     if preview.get("revision_note"):
         assumptions = assumptions + [f"Latest revision request: {preview['revision_note']}"]
     if not assumptions:
@@ -1303,6 +1557,9 @@ def render_plan_preview(runtime_dir: Path) -> str:
         "**Proposed Plan**",
         "\n".join(summarize_preview_plan(state)),
         "",
+        "**How Step 1 Will Be Done**",
+        "\n".join(f"- {item}" for item in first_step_method) if first_step_method else "- none",
+        "",
         "**Risks / Open Questions**",
         "\n".join(risks),
         "",
@@ -1315,6 +1572,7 @@ def render_plan_preview(runtime_dir: Path) -> str:
 
 def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
     state = load_state(runtime_dir)
+    daemon = daemon_snapshot(runtime_dir)
     goal = state["mission"].get("title", Path(runtime_dir).name)
     waiting_reason = state["lifecycle"].get("stop_reason", "").strip()
     lifecycle = "paused" if state["supervisor"].get("paused") else state["lifecycle"].get("status", "")
@@ -1332,15 +1590,22 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
     current_phase = execution.get("current_phase", {})
     next_action = execution.get("next_action", {})
     phase_plan = execution.get("phase_plan", [])
+    next_step_method = next_action.get("read_ladder", [])
+    if not next_step_method:
+        next_step_method = derive_step_method(runtime_dir, current_phase.get("related_plan_step", "") or current_phase.get("goal", ""))
 
     header = "**Auto-Codex Sync**" if flavor == "sync" else "**Auto-Codex Status**"
     wait_banner: list[str] = []
-    if lifecycle == "waiting_job":
+    if daemon.get("running") and has_delayed_wake(state):
+        banner_line = "Auto-Codex is waiting on a real delayed wake and will resume automatically."
+        if lifecycle != "waiting_job":
+            banner_line = "Auto-Codex has scheduled the next delayed wake and will resume automatically."
         wait_banner = [
-            "**(Entering wait)**",
-            f"- Auto-Codex is waiting for the next scheduled wake-up, not exiting.",
+            "**[begin sleep]**",
+            f"- {banner_line}",
+            f"- will come back in: {format_sleep_duration(state.get('progress', {}).get('next_sleep_seconds', 0))}",
             f"- planned wake at: {state.get('progress', {}).get('planned_wake_at', '') or 'none'}",
-            f"- sleep reason: {state.get('progress', {}).get('sleep_reason', '') or 'none'}",
+            f"- reason: {state.get('progress', {}).get('sleep_reason', '') or 'none'}",
             "",
         ]
     sections = [
@@ -1390,6 +1655,9 @@ def render_mode_report(runtime_dir: Path, flavor: str = "status") -> str:
         f"- search patterns: {', '.join(next_action.get('search_patterns', [])) or 'none'}",
         f"- success condition: {next_action.get('success_condition', '') or 'none'}",
         f"- fallback: {next_action.get('fallback_if_missing', '') or 'none'}",
+        "",
+        f"**How This Step Will Be Done**",
+        "\n".join(f"- {item}" for item in next_step_method) if next_step_method else "- none",
     ]
     return "\n".join(sections).strip() + "\n"
 
@@ -1456,6 +1724,16 @@ def capture_command(
         timeout_note = f"Command timed out after {timeout_seconds} seconds."
         stderr = f"{stderr}\n{timeout_note}".strip()
         return subprocess.CompletedProcess(cmd, 124, stdout=stdout, stderr=stderr)
+
+
+def codex_exec_supports_search() -> bool:
+    global CODEX_EXEC_SEARCH_SUPPORT
+    if CODEX_EXEC_SEARCH_SUPPORT is not None:
+        return CODEX_EXEC_SEARCH_SUPPORT
+    result = capture_command(["codex", "exec", "--help"])
+    help_text = "\n".join(part for part in [result.stdout, result.stderr] if part)
+    CODEX_EXEC_SEARCH_SUPPORT = "--search" in help_text
+    return CODEX_EXEC_SEARCH_SUPPORT
 
 
 def lark_env() -> dict[str, str]:
@@ -1709,7 +1987,7 @@ def codex_command(
             cmd.extend(["-s", sandbox_mode])
         if approval_policy in VALID_APPROVAL_POLICIES:
             cmd.extend(["-c", f'approval_policy="{approval_policy}"'])
-    if search_enabled:
+    if search_enabled and codex_exec_supports_search():
         cmd.append("--search")
     for item in extra_config:
         cmd.extend(["-c", item])
@@ -2107,7 +2385,7 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     sleep_seconds, sleep_reason = choose_sleep_policy(runtime_dir, state, worker_result)
     state["progress"]["next_sleep_seconds"] = sleep_seconds
     state["progress"]["sleep_reason"] = sleep_reason
-    state["progress"]["planned_wake_at"] = iso_after_seconds(sleep_seconds)
+    state["progress"]["planned_wake_at"] = iso_after_seconds(sleep_seconds) if sleep_seconds > 0 else ""
     merge_execution_packet(
         runtime_dir,
         state,
@@ -2184,7 +2462,7 @@ def init_runtime(args: argparse.Namespace) -> int:
         runtime_dir,
         title,
         extract_doc_urls(mission_text),
-        seeded_plan_steps(mission_text),
+        seeded_plan_steps(mission_text, mission_path=mission_path, doc_urls=extract_doc_urls(mission_text)),
     )
     state["lifecycle"]["status"] = "awaiting_plan_confirmation"
     if args.doc_url:
@@ -2226,10 +2504,23 @@ def start_runtime(args: argparse.Namespace) -> int:
         sleep_seconds = clamp_sleep_seconds(state["progress"].get("next_sleep_seconds", DEFAULT_INTERVAL_SECONDS))
         state["supervisor"]["last_sleep_seconds"] = sleep_seconds
         state["progress"]["next_sleep_seconds"] = sleep_seconds
-        state["progress"]["planned_wake_at"] = iso_after_seconds(sleep_seconds)
+        state["progress"]["planned_wake_at"] = iso_after_seconds(sleep_seconds) if sleep_seconds > 0 else ""
         if not state["progress"].get("sleep_reason", "").strip():
-            state["progress"]["sleep_reason"] = "Use the default one-hour polling interval unless the worker provides a shorter estimate."
+            state["progress"]["sleep_reason"] = (
+                "Continue immediately with the next worker burst."
+                if sleep_seconds <= 0
+                else "Use the default one-hour polling interval unless the worker provides a shorter estimate."
+            )
         save_state(runtime_dir, state)
+        if sleep_seconds <= 0:
+            append_event(
+                runtime_dir,
+                "supervisor_continue",
+                {
+                    "reason": state["progress"].get("sleep_reason", ""),
+                },
+            )
+            continue
         append_event(
             runtime_dir,
             "supervisor_sleep",
@@ -2361,9 +2652,9 @@ def mode_approve_plan(args: argparse.Namespace) -> int:
     state["planning"]["current"]["approved_at"] = approved_at
     state["lifecycle"]["status"] = "running"
     state["progress"]["summary"] = "Plan approved. Ready to execute."
-    state["progress"]["next_sleep_seconds"] = DEFAULT_INTERVAL_SECONDS
-    state["progress"]["sleep_reason"] = "Execution is ready; use the default one-hour polling interval until the worker returns a more specific estimate."
-    state["progress"]["planned_wake_at"] = iso_after_seconds(DEFAULT_INTERVAL_SECONDS)
+    state["progress"]["next_sleep_seconds"] = 0
+    state["progress"]["sleep_reason"] = "Execution is approved; continue immediately once the daemon starts."
+    state["progress"]["planned_wake_at"] = ""
     merge_execution_packet(runtime_dir, state, packet={}, overwrite_missing_only=False)
     append_event(runtime_dir, "plan_confirmed", {"version": preview.get("version", 1)})
     save_state(runtime_dir, state)
@@ -2413,7 +2704,11 @@ def mode_revise_plan(args: argparse.Namespace) -> int:
     add_input(forwarded)
 
     state = load_state(runtime_dir)
-    base_items = preview_plan_items(state) or current_plan_items(state) or seeded_plan_steps(read_text(runtime_dir / "mission.md"))
+    base_items = preview_plan_items(state) or current_plan_items(state) or seeded_plan_steps(
+        read_text(runtime_dir / "mission.md"),
+        mission_path=Path(state["mission"].get("source_path", "")).expanduser() if state.get("mission", {}).get("source_path") else None,
+        doc_urls=list(state.get("mission", {}).get("doc_urls", [])),
+    )
     revised_items = [{"step": f"Apply the latest user steering before execution: {revision_note}", "status": "in_progress"}]
     for item in base_items:
         step = str(item.get("step", "")).strip()
@@ -2501,6 +2796,9 @@ def mode_resume(args: argparse.Namespace) -> int:
         state["lifecycle"]["status"] = "running"
     state["lifecycle"]["stop_requested"] = False
     state["lifecycle"]["stop_reason"] = ""
+    state["progress"]["next_sleep_seconds"] = 0
+    state["progress"]["sleep_reason"] = "Resumed; continue immediately with the next worker burst."
+    state["progress"]["planned_wake_at"] = ""
     append_event(runtime_dir, "mode_resumed", {})
     save_state(runtime_dir, state)
     print(render_mode_report(runtime_dir, flavor="status"))

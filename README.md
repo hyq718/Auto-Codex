@@ -191,6 +191,16 @@ The idea is simple:
 - user confirms
 - execution starts
 
+The preview is expected to be mission-specific, not generic boilerplate.
+At minimum it should identify:
+
+- the concrete code or data artifacts being changed
+- the correctness-preserving decomposition or reverse-engineering step
+- the initial implementation seam
+- the validation or equivalence strategy
+- the higher-cost benchmark or job phase
+- the reporting sink and iteration loop
+
 ### Summary First, Deep Read Later
 
 The runtime is designed to reduce token waste.
@@ -214,6 +224,18 @@ It is:
 - how it should widen the read budget if the first retrieval misses
 
 This is why the runtime keeps a `resume_status.md` and an execution packet in `state.json`.
+
+### Explain The Next Step
+
+`Auto-Codex` should not only say what the next step is.
+
+It should also explain how that step will be executed.
+
+In practice this means:
+
+- the plan preview should explain how step 1 will be carried out
+- status and sync views should explain how the current next step will be executed
+- worker responses should keep `next_action.read_ladder` concrete enough to show directly to the user
 
 ## Runtime Layout
 
