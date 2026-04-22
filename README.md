@@ -298,6 +298,7 @@ When launching Slurm jobs and the user has not pinned one exact GPU type, prefer
 
 `waiting_job` is only valid while at least one tracked job is genuinely queued or running. If the queue has gone stale, the runtime should reconcile terminal states and resume active work instead of sleeping on an already-dead job.
 When the worker itself fails or times out, retry on a short five-minute loop by default. Reserve the one-hour polling cadence for genuine `waiting_job` loops or explicit long external waits.
+`stop_reason` is reserved for true terminal stop requests. A non-terminal worker burst should leave it empty; strings such as `continue_immediately` belong in `sleep_reason`, not in `stop_reason`.
 4. read a small local window
 5. only then widen to more logs or more jobs
 

@@ -1177,6 +1177,14 @@ def choose_sleep_policy(runtime_dir: Path, state: dict[str, Any], worker_result:
     return worker_sleep, worker_reason
 
 
+def should_stop_after_worker(worker_result: dict[str, Any]) -> bool:
+    reason = str(worker_result.get("stop_reason", "")).strip()
+    status = str(worker_result.get("status", "")).strip()
+    if not reason:
+        return False
+    return status in {"done", "blocked", "failed"}
+
+
 def job_status_bucket(status: str) -> int:
     lowered = normalize_job_status(status)
     if lowered in JOB_ATTENTION_STATUSES:
@@ -2950,9 +2958,12 @@ def perform_tick(runtime_dir: Path, args: argparse.Namespace) -> int:
     else:
         state["lifecycle"]["status"] = "running"
 
-    if worker_result["stop_reason"]:
+    if should_stop_after_worker(worker_result):
         state["lifecycle"]["stop_requested"] = True
         state["lifecycle"]["stop_reason"] = worker_result["stop_reason"]
+    else:
+        state["lifecycle"]["stop_requested"] = False
+        state["lifecycle"]["stop_reason"] = ""
 
     maybe_send_periodic_heartbeat(runtime_dir, state, args.disable_lark)
     save_state(runtime_dir, state)

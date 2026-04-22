@@ -40,6 +40,7 @@ Rules:
 - If you are blocked on a missing permission, resource, or human decision, return `status="blocked"`.
 - If the mission is complete, return `status="done"`.
 - If the mission is complete, include a concise acceptance-grade summary in `final_summary_markdown`.
+- Leave `stop_reason` empty unless you intentionally want the supervisor loop to stop after this tick. That should normally only happen for terminal outcomes such as `done`, `blocked`, or `failed`; never use `stop_reason` to say things like `continue_immediately`.
 - Do not return markdown fences. The final response must be raw JSON matching the schema.
 
 Pending inputs summary:
